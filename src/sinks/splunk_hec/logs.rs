@@ -52,7 +52,7 @@ fn host_key() -> String {
 }
 
 inventory::submit! {
-    SinkDescription::new::<HecSinkLogsConfig>("splunk_hec")
+    SinkDescription::new::<HecSinkCompatConfig>("splunk_hec")
 }
 
 inventory::submit! {
@@ -111,6 +111,12 @@ impl SinkConfig for HecSinkLogsConfig {
 struct HecSinkCompatConfig {
     #[serde(flatten)]
     config: HecSinkLogsConfig,
+}
+
+impl GenerateConfig for HecSinkCompatConfig {
+    fn generate_config() -> toml::Value {
+        HecSinkLogsConfig::generate_config()
+    }
 }
 
 #[async_trait::async_trait]
