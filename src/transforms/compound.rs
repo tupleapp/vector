@@ -1,24 +1,15 @@
 use crate::{
-    config::{
-        DataType, ExpandType, GenerateConfig, TransformConfig, TransformContext,
-        TransformDescription,
-    },
-    transforms::Transform,
+    config::{DataType, GenerateConfig, TransformConfig, TransformContext, TransformDescription},
+    event::Event,
+    transforms::{TaskTransform, Transform},
 };
-use indexmap::IndexMap;
+use futures::{stream, Stream, StreamExt};
 use serde::{self, Deserialize, Serialize};
+use std::pin::Pin;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CompoundConfig {
-    steps: Vec<TransformStep>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct TransformStep {
-    id: Option<String>,
-
-    #[serde(flatten)]
-    transform: Box<dyn TransformConfig>,
+    steps: Vec<Box<dyn TransformConfig>>,
 }
 
 inventory::submit! {
@@ -34,31 +25,10 @@ impl GenerateConfig for CompoundConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "compound")]
 impl TransformConfig for CompoundConfig {
-    async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
-        Err("this transform must be expanded".into())
-    }
-
-    fn expand(
-        &mut self,
-    ) -> crate::Result<Option<(IndexMap<String, Box<dyn TransformConfig>>, ExpandType)>> {
-        let mut map: IndexMap<String, Box<dyn TransformConfig>> = IndexMap::new();
-        for (i, step) in self.steps.iter().enumerate() {
-            if map
-                .insert(
-                    step.id.as_ref().cloned().unwrap_or_else(|| i.to_string()),
-                    step.transform.to_owned(),
-                )
-                .is_some()
-            {
-                return Err("conflicting id found while expanding transform".into());
-            }
-        }
-
-        if !map.is_empty() {
-            Ok(Some((map, ExpandType::Serial)))
-        } else {
-            Err("must specify at least one transform".into())
-        }
+    async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
+        Compound::new(self.clone(), context)
+            .await
+            .map(Transform::task)
     }
 
     fn input_type(&self) -> DataType {
@@ -71,6 +41,53 @@ impl TransformConfig for CompoundConfig {
 
     fn transform_type(&self) -> &'static str {
         "compound"
+    }
+}
+
+pub struct Compound {
+    transforms: Vec<Transform>,
+}
+
+impl Compound {
+    pub async fn new(config: CompoundConfig, context: &TransformContext) -> crate::Result<Self> {
+        let steps = &config.steps;
+        let mut transforms = vec![];
+        if !steps.is_empty() {
+            for transform_config in steps.iter() {
+                let transform = transform_config.build(context).await?;
+                transforms.push(transform);
+            }
+            Ok(Self { transforms })
+        } else {
+            Err("must specify at least one transform".into())
+        }
+    }
+}
+
+impl TaskTransform for Compound {
+    fn transform(
+        self: Box<Self>,
+        task: Pin<Box<dyn Stream<Item = Event> + Send>>,
+    ) -> Pin<Box<dyn Stream<Item = Event> + Send>>
+    where
+        Self: 'static,
+    {
+        let mut task = task;
+        for t in self.transforms {
+            match t {
+                Transform::Task(t) => {
+                    task = t.transform(task);
+                }
+                Transform::Function(mut t) => {
+                    task = Box::pin(task.flat_map(move |v| {
+                        let mut output = Vec::<Event>::new();
+                        t.transform(&mut output, v);
+                        stream::iter(output)
+                    }));
+                }
+            }
+        }
+        task
     }
 }
 
