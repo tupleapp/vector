@@ -99,31 +99,4 @@ mod test {
     fn generate_config() {
         crate::test_util::test_generate_config::<super::CompoundConfig>();
     }
-
-    #[test]
-    fn can_serialize_nested_transforms() {
-        // We need to serialize the config to check if a config has
-        // changed when reloading.
-        let config = toml::from_str::<CompoundConfig>(
-            r#"
-            [[steps]]
-            type = "mock"
-            suffix = "step1"
-
-            [[steps]]
-            type = "mock"
-            id = "foo"
-            suffix = "step1"
-        "#,
-        )
-        .unwrap()
-        .expand()
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_string(&config).unwrap(),
-            r#"[{"0":{"type":"mock"},"foo":{"type":"mock"}},"Serial"]"#
-        );
-    }
 }
