@@ -28,12 +28,14 @@
           {{ end }}
 
           {{ range $k, $v := $v.type }}
-          {{ $isArray := eq $k "array" }}
-          {{ if $isArray }}
+          {{ if eq $k "array" }}
           {{ range $k, $v := $v.items.type }}
           {{ $name := printf "[%s]" $k }}
           {{ partial "badge.html" (dict "word" $name "color" "gray") }}
           {{ end }}
+          {{ else if eq $k "multi_condition" }}
+          {{ partial "badge.html" (dict "word" "condition" "color" "gray") }}
+          {{ partial "badge.html" (dict "word" "[vrl | datadog_search]" "color" "gray") }}
           {{ else }}
           {{ partial "badge.html" (dict "word" $k "color" "gray") }}
           {{ end }}
@@ -60,8 +62,6 @@
       </div>
 
       {{ range $k, $v := $v.type }}
-
-
 
       {{ if eq $k "object" }} {{/* Object (with sub-configs) */}}
       <div class="mt-4 border dark:border-gray-700 rounded flex flex-col divide-y dark:divide-gray-700">
@@ -153,6 +153,8 @@
         {{ end }}
       </div>
       {{ end }}
+      {{ else if eq $k "multi_condition" }} {{/* Multiple condition options */}}
+      {{ template "multi_syntax" $v }}
       {{ else }} {{/* Non-arrays/objects */}}
       {{ if eq $v.syntax "template" }}
       <div class="mt-4 text-sm">
@@ -1867,6 +1869,43 @@
         {{ template "code" . }}
       </div>
     </div>
+    {{ end }}
+  </div>
+</div>
+{{ end }}
+
+{{ define "multi_syntax" }}
+<div class="mt-4">
+  {{ partial "heading.html" (dict "text" "Available syntaxes" "level" 4 "toc_hide" true) }}
+
+  <table class="mt-4">
+    <thead>
+      <tr>
+        <th>
+          Syntax
+        </th>
+        <th>
+          Description
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range $k, $v := .available_syntaxes }}
+      <tr>
+        <td>
+          <code>{{ $k }}</code>
+        </td>
+        <td>
+          {{ $v | markdownify }}
+        </td>
+      </tr>
+      {{ end }}
+    </tbody>
+  </table>
+
+  <div class="border rounded dark:border-gray-700 p-2">
+    {{ range $k, $v := .options }}
+    {{ $v }}
     {{ end }}
   </div>
 </div>

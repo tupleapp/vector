@@ -349,22 +349,47 @@ _values: {
 
 #Type: {
 	_args: {
-		arrays:   true
 		required: bool
 	}
 	let Args = _args
 
-	// `*` represents a wildcard type.
-	//
-	// For example, the `sinks.http.headers.*` option allows for arbitrary
-	// key/value pairs.
 	{"array": #TypeArray & {_args: required: Args.required}} |
+	{"multi_condition": #TypeMultiCondition & {_args: required: Args.required}} |
 	#TypePrimitive
+}
+
+#TypeMultiCondition: {
+	_args: {
+		required: bool
+	}
+	let Args = _args
+
+	required: bool & Args.required
+
+	available_syntaxes: {
+		vrl: "A Boolean expression in [Vector Remap Language](\(urls.vrl))."
+		datadog_search: "A Boolean expression in [Datadog Search syntax](\(urls.datadog_search_syntax))."
+	}
+
+	examples: {
+		vrl: #".status_code != 200 && !includes(["info", "debug"], .severity)"#
+		datadog_search: "@http.status_code:[400 TO 499]"
+	}
+
+	options: {
+		source: {
+			required: true
+			description: "The string expression."
+		}
+		type: {
+			required: true
+			description: "The syntax."
+		}
+	}
 }
 
 #TypePrimitive: {
 	_args: {
-		arrays:   true
 		required: bool
 	}
 	let Args = _args

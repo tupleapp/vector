@@ -42,12 +42,7 @@ components: transforms: filter: {
 				"""
 			required: true
 			warnings: []
-			type: string: {
-				examples: [
-					#".status_code != 200 && !includes(["info", "debug"], .severity)"#,
-				]
-				syntax: "vrl_boolean_expression"
-			}
+			type: multi_condition: {}
 		}
 	}
 

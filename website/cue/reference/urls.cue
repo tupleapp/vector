@@ -576,6 +576,7 @@ urls: {
 	vector_twitter:                                           "https://twitter.com/vectordotdev"
 	vector_unit_testing:                                      "/guides/level-up/unit-testing/"
 	vector_version_branches:                                  "\(vector_repo)/branches/all?query=v"
+	vrl: "https://vrl.dev"
 	vrl_announcement:                                         "/blog/vector-remap-language"
 	vrl_error_handling:                                       "\(vrl_errors_reference)#handling"
 	vrl_error_handling_assigning:                             "\(vrl_errors_reference)#assigning"
