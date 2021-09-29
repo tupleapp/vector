@@ -37,26 +37,13 @@ components: transforms: compound: {
 		steps: {
 			description: """
 				A list of transforms configurations' representing the chain of transforms to be applied on incoming
-				events. All transforms in the chain can then be referenced as an input by other components with the name
-				`<transform_name>.<nested_transform_name>`. All transforms in the chain also generate internal metrics
-				as if they were configured separately.
+				events.
 				"""
 			required: true
 			warnings: []
 			type: array: {
 				items: type: object: {
 					options: {
-						id: {
-							common:      true
-							description: "The ID to use for the transform. This will show up in metrics and logs in the format: `<compound transform id>.<step id>`. If not set, the index of the step will be used as its id."
-							required:    false
-							warnings: []
-							type: string: {
-								default: null
-								examples: ["my_filter_transform"]
-								syntax: "literal"
-							}
-						}
 						"*": {
 							description: """
 							Any valid transform configuration. See [transforms documentation](\(urls.vector_transforms))
