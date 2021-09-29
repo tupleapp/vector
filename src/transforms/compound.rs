@@ -22,13 +22,41 @@ impl GenerateConfig for CompoundConfig {
     }
 }
 
+impl CompoundConfig {
+    fn consistent_types(&self) -> bool {
+        let mut it = self.steps.iter();
+        let mut p = match it.next() {
+            Some(p) => p,
+            None => {
+                return true;
+            }
+        };
+        while let Some(n) = it.next() {
+            match (p.output_type(), n.input_type()) {
+                (DataType::Log, DataType::Metric) => {
+                    return false;
+                }
+                (DataType::Metric, DataType::Log) => {
+                    return false;
+                }
+                _ => p = n,
+            };
+        }
+        true
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "compound")]
 impl TransformConfig for CompoundConfig {
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
-        Compound::new(self.clone(), context)
-            .await
-            .map(Transform::task)
+        if !self.consistent_types() {
+            Err("Inconsistent type in a compound transform".into())
+        } else {
+            Compound::new(self.clone(), context)
+                .await
+                .map(Transform::task)
+        }
     }
 
     fn input_type(&self) -> DataType {
@@ -93,8 +121,6 @@ impl TaskTransform for Compound {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<super::CompoundConfig>();

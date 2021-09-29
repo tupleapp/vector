@@ -1493,17 +1493,10 @@ mod tests {
     #[tokio::test]
     async fn type_inconsistency_while_expanding_transform() {
         let config: ConfigBuilder = toml::from_str(indoc! {r#"
-            [sources.input]
-              type = "generator"
-              format = "shuffle"
-              lines = ["one", "two"]
-              count = 5
-
             [transforms.foo]
               inputs = ["input"]
               type = "compound"
               [[transforms.foo.steps]]
-                id = "step1"
                 type = "log_to_metric"
                 [[transforms.foo.steps.metrics]]
                   type = "counter"
@@ -1511,7 +1504,6 @@ mod tests {
                   name = "sum"
                   namespace = "ns"
               [[transforms.foo.steps]]
-                id = "step2"
                 type = "log_to_metric"
                 [[transforms.foo.steps.metrics]]
                   type = "counter"
@@ -1521,16 +1513,31 @@ mod tests {
 
             [sinks.output]
               type = "console"
-              inputs = [ "foo.step2" ]
+              inputs = [ "foo" ]
               encoding = "json"
               target = "stdout"
+
+            [[tests]]
+              name = "broken test"
+
+              [tests.input]
+                insert_at = "foo"
+                value = "nah this doesnt matter"
+
+              [[tests.outputs]]
+                extract_from = "foo"
+                [[tests.outputs.conditions]]
+                  type = "check_fields"
         "#})
         .unwrap();
 
-        let err = crate::config::compiler::compile(config).err().unwrap();
+        let errs = build_unit_tests(config).await.err().unwrap();
         assert_eq!(
-            err,
-            vec!["Data type mismatch between foo.step1 (Metric) and foo.step2 (Log)".to_owned()]
+            errs,
+            vec![indoc! {r#"
+                Failed to build test 'broken test':
+                  failed to build transform 'foo': Inconsistent type in a compound transform"#}
+            .to_owned(),]
         );
     }
 
