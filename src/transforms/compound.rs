@@ -31,7 +31,7 @@ impl CompoundConfig {
                 return true;
             }
         };
-        while let Some(n) = it.next() {
+        for n in it {
             match (p.output_type(), n.input_type()) {
                 (DataType::Log, DataType::Metric) => {
                     return false;
