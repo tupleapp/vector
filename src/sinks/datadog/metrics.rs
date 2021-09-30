@@ -64,9 +64,9 @@ struct DatadogSink {
 }
 
 // https://docs.datadoghq.com/api/?lang=bash#post-timeseries-points
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct DatadogRequest<T> {
-    series: Vec<T>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DatadogRequest<T> {
+    pub(crate) series: Vec<T>,
 }
 
 impl DatadogConfig {
@@ -113,16 +113,23 @@ struct DatadogDistributionMetric {
     tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct DatadogMetric {
-    metric: String,
-    r#type: DatadogMetricType,
-    interval: Option<i64>,
-    points: Vec<DatadogPoint<f64>>,
-    tags: Option<Vec<String>>,
+// https://github.com/DataDog/datadog-agent/blob/b01620fe782de7fadd8ec96ab572e352eb503954/pkg/metrics/series.go#L45-L57
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DatadogMetric {
+    pub(crate) metric: String,
+    pub(crate) r#type: DatadogMetricType,
+    pub(crate) interval: Option<i64>,
+    pub(crate) points: Vec<DatadogPoint<f64>>,
+    pub(crate) tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_type_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) device: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatadogMetricType {
     Gauge,
@@ -130,8 +137,8 @@ pub enum DatadogMetricType {
     Rate,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct DatadogPoint<T>(i64, T);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DatadogPoint<T>(pub(crate) i64, pub(crate) T);
 
 #[derive(Debug, Clone, PartialEq)]
 struct DatadogStats {
@@ -389,6 +396,9 @@ fn encode_events(
                     interval: Some(interval),
                     points: vec![DatadogPoint(ts, *value)],
                     tags,
+                    host: None,
+                    source_type_name: None,
+                    device: None,
                 }]),
                 MetricValue::Distribution {
                     samples,
@@ -403,6 +413,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, s.min)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             },
                             DatadogMetric {
                                 metric: format!("{}.avg", &fullname),
@@ -410,6 +423,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, s.avg)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             },
                             DatadogMetric {
                                 metric: format!("{}.count", &fullname),
@@ -417,6 +433,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, s.count)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             },
                             DatadogMetric {
                                 metric: format!("{}.median", &fullname),
@@ -424,6 +443,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, s.median)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             },
                             DatadogMetric {
                                 metric: format!("{}.max", &fullname),
@@ -431,6 +453,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, s.max)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             },
                         ];
                         for (q, v) in s.quantiles {
@@ -440,6 +465,9 @@ fn encode_events(
                                 interval: Some(interval),
                                 points: vec![DatadogPoint(ts, v)],
                                 tags: tags.clone(),
+                                host: None,
+                                source_type_name: None,
+                                device: None,
                             })
                         }
                         Some(result)
@@ -453,6 +481,9 @@ fn encode_events(
                     interval: None,
                     points: vec![DatadogPoint(ts, values.len() as f64)],
                     tags,
+                    host: None,
+                    source_type_name: None,
+                    device: None,
                 }]),
                 MetricValue::Gauge { value } => Some(vec![DatadogMetric {
                     metric: fullname,
@@ -460,6 +491,9 @@ fn encode_events(
                     interval: None,
                     points: vec![DatadogPoint(ts, *value)],
                     tags,
+                    host: None,
+                    source_type_name: None,
+                    device: None,
                 }]),
                 _ => None,
             }
