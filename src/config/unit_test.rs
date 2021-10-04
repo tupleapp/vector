@@ -1491,7 +1491,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn type_inconsistency_while_expanding_transform() {
+    async fn compound_transform() {
+        let config: ConfigBuilder = toml::from_str(indoc! {r#"
+            [transforms.test_input]
+              inputs = ["ignored"]
+              type = "remove_fields"
+              fields = ["timestamp"]
+
+            [transforms.foo]
+              inputs = ["test_input"]
+              type = "compound"
+              [[transforms.foo.steps]]
+                type = "add_fields"
+                [transforms.foo.steps.fields]
+                  foo = "bar"
+                  bar = "baz"
+              [[transforms.foo.steps]]
+                type = "add_fields"
+                [transforms.foo.steps.fields]
+                  foo = "barbaz"
+
+            [sinks.output]
+              type = "console"
+              inputs = [ "foo" ]
+              encoding = "json"
+              target = "stdout"
+
+            [[tests]]
+              name = "compound test"
+
+              [tests.input]
+                insert_at = "foo"
+                value = "lorem ipsum"
+
+              [[tests.outputs]]
+                extract_from = "foo"
+                [[tests.outputs.conditions]]
+                  type = "check_fields"
+                  "foo.equals" = "barbaz"
+                  "bar.equals" = "baz"
+        "#})
+        .unwrap();
+
+        let mut tests = build_unit_tests(config).await.unwrap();
+        assert_eq!(tests[0].run().1, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn type_inconsistency_in_compound_transform() {
         let config: ConfigBuilder = toml::from_str(indoc! {r#"
             [transforms.foo]
               inputs = ["input"]
