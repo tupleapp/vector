@@ -1,6 +1,6 @@
 use super::{ComponentKey, Config, OutputId, SinkOuter, SourceOuter};
 use crate::{
-    sinks::datadog::metrics::DatadogConfig, sources::internal_metrics::InternalMetricsConfig,
+    sinks::datadog::metrics::DatadogMetricsConfig, sources::internal_metrics::InternalMetricsConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -75,7 +75,7 @@ pub fn try_attach(config: &mut Config) -> bool {
     );
 
     // Create a Datadog metrics sink to consume and emit internal + host metrics.
-    let datadog_metrics = DatadogConfig::from_api_key(api_key);
+    let datadog_metrics = DatadogMetricsConfig::from_api_key(api_key);
 
     config.sinks.insert(
         datadog_metrics_id,
