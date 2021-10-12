@@ -652,7 +652,7 @@ mod tests {
             let decoder =
                 codecs::Decoder::new(Box::new(BytesCodec::new()), Box::new(BytesParser::new()));
             let source = DatadogAgentSource::new(true, decoder);
-            let events = source.decode_body(body, api_key).unwrap();
+            let events = source.decode_log_body(body, api_key).unwrap();
             assert_eq!(events.len(), msgs.len());
             for (msg, event) in msgs.into_iter().zip(events.into_iter()) {
                 let log = event.as_log();
