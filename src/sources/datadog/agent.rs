@@ -1,3 +1,4 @@
+use super::sketch_parser::decode_ddsketch;
 use crate::{
     codecs::{self, DecodingConfig},
     config::{
@@ -8,7 +9,10 @@ use crate::{
         metric::{Metric, MetricKind, MetricValue},
         Event,
     },
-    internal_events::HttpDecompressError,
+    internal_events::{
+        DatadogAgentLogDecoded, DatadogAgentMetricDecoded, DatadogAgentRequestReceived,
+        HttpDecompressError,
+    },
     sinks::datadog::metrics::{DatadogMetric, DatadogMetricType, DatadogRequest},
     sources::{
         self,
@@ -18,10 +22,9 @@ use crate::{
     Pipeline,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::Utc;
 use chrono::{TimeZone, Utc};
-use flate2::read::{DeflateDecoder, MultiGzDecoder};
-use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
+use flate2::read::{MultiGzDecoder, ZlibDecoder};
+use futures::{future, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use http::StatusCode;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -86,13 +89,23 @@ impl SourceConfig for DatadogAgentConfig {
         let log_service = source
             .clone()
             .event_service(cx.acknowledgements, cx.out.clone());
-        let series_service = source.series_service(cx.acknowledgements, cx.out.clone());
+        let series_v1_service = source
+            .clone()
+            .series_v1_service(cx.acknowledgements, cx.out.clone());
+        let sketches_service = source
+            .clone()
+            .sketches_service(cx.acknowledgements, cx.out.clone());
+        let series_v2_service = source.series_v2_service();
 
         let shutdown = cx.shutdown;
         Ok(Box::pin(async move {
             let span = crate::trace::current_span();
             let routes = log_service
-                .or(series_service)
+                .or(series_v1_service)
+                .unify()
+                .or(series_v2_service)
+                .unify()
+                .or(sketches_service)
                 .unify()
                 .with(warp::trace(move |_info| span.clone()))
                 .recover(|r: Rejection| async move {
@@ -238,7 +251,7 @@ impl DatadogAgentSource {
             .boxed()
     }
 
-    fn series_service(self, acknowledgements: bool, out: Pipeline) -> BoxedFilter<(Response,)> {
+    fn series_v1_service(self, acknowledgements: bool, out: Pipeline) -> BoxedFilter<(Response,)> {
         warp::post()
             .and(path!("api" / "v1" / "series" / ..))
             .and(warp::path::full())
@@ -259,6 +272,55 @@ impl DatadogAgentSource {
                     };
                     let events = decode(&encoding_header, body)
                         .and_then(|body| self.decode_metric_body(body, token));
+                    Self::handle_request(events, acknowledgements, out.clone())
+                },
+            )
+            .boxed()
+    }
+
+    fn series_v2_service(self) -> BoxedFilter<(Response,)> {
+        warp::post()
+            // This should not happen as the v2 series endpoint does not exist yet
+            .and(path!("api" / "v2" / "series" / ..))
+            .and_then(|| {
+                error!(message = "/api/v2/series route is not supported.");
+                let response: Result<Response, Rejection> = Ok(warp::reply().into_response());
+                future::ready(response)
+            })
+            .boxed()
+    }
+
+    fn sketches_service(self, acknowledgements: bool, out: Pipeline) -> BoxedFilter<(Response,)> {
+        warp::post()
+            .and(path!("api" / "beta" / "sketches" / ..))
+            .and(warp::path::full())
+            .and(warp::header::optional::<String>("content-encoding"))
+            .and(warp::header::optional::<String>("dd-api-key"))
+            .and(warp::query::<ApiKeyQueryParams>())
+            .and(warp::body::bytes())
+            .and_then(
+                move |path: FullPath,
+                 encoding_header: Option<String>,
+                 api_token: Option<String>,
+                 query_params: ApiKeyQueryParams,
+                 body: Bytes| {
+                    error!(message = "/api/beta/sketches route is not yet fully supported.");
+                    let token: Option<Arc<str>> = if self.store_api_key {
+                        self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key)
+                    } else {
+                        None
+                    };
+                    let events = decode(&encoding_header, body)
+                        .and_then(|body| {
+                            decode_ddsketch(body, token).map_err(|error| {
+                                ErrorMessage::new(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    format!("Error decoding Datadog sketch: {:?}", error),
+                                )
+                            })
+                        });
+                    //let response: Result<Response, Rejection> = Ok(warp::reply().into_response());
+                    //future::ready(response)
                     Self::handle_request(events, acknowledgements, out.clone())
                 },
             )
@@ -290,8 +352,13 @@ impl DatadogAgentSource {
         // Temporary
         debug!(
             metrics = "Deserialized datadog metric payload - /api/v1/series",
-            payload = ?metrics,
+           payload = ?metrics,
         );
+        emit!(&DatadogAgentMetricDecoded {
+            byte_size: body.len(),
+            count: metrics.series.len(),
+        });
+
         Ok(metrics
             .series
             .into_iter()
@@ -362,6 +429,10 @@ impl DatadogAgentSource {
                 }
             }
         }
+        emit!(&DatadogAgentLogDecoded {
+            byte_size: body.len(),
+            count: decoded.len(),
+        });
 
         Ok(decoded)
     }
@@ -395,7 +466,10 @@ fn decode(header: &Option<String>, mut body: Bytes) -> Result<Bytes, ErrorMessag
             }
         }
     }
-
+    emit!(&DatadogAgentRequestReceived {
+        byte_size: body.len(),
+        count: 1,
+    });
     Ok(body)
 }
 
@@ -405,6 +479,19 @@ fn into_vector_metric(dd_metric: DatadogMetric, api_key: Option<Arc<str>>) -> Ve
         let kv = tag.split_once(":").unwrap_or((&tag, ""));
         tags.insert(kv.0.trim().into(), kv.1.trim().into());
     }
+    dd_metric
+        .host
+        .as_ref()
+        .and_then(|host| tags.insert("host".into(), host.to_owned()));
+    dd_metric
+        .source_type_name
+        .as_ref()
+        .and_then(|source| tags.insert("source_type_name".into(), source.to_owned()));
+    dd_metric
+        .device
+        .as_ref()
+        .and_then(|dev| tags.insert("device".into(), dev.to_owned()));
+
     match dd_metric.r#type {
         DatadogMetricType::Count => dd_metric
             .points
@@ -412,7 +499,7 @@ fn into_vector_metric(dd_metric: DatadogMetric, api_key: Option<Arc<str>>) -> Ve
             .map(|dd_point| {
                 Metric::new(
                     dd_metric.metric.clone(),
-                    MetricKind::Absolute,
+                    MetricKind::Incremental,
                     MetricValue::Counter { value: dd_point.1 },
                 )
                 .with_timestamp(Some(Utc.timestamp(dd_point.0, 0)))
@@ -448,10 +535,32 @@ fn into_vector_metric(dd_metric: DatadogMetric, api_key: Option<Arc<str>>) -> Ve
                 metric.into()
             })
             .collect(),
-        DatadogMetricType::Rate => {
-            debug!(message = "DD Rate metric - not yet supported ",);
-            vec![]
-        }
+        // Agent sends rate only for dogstatsd counter https://github.com/DataDog/datadog-agent/blob/f4a13c6dca5e2da4bb722f861a8ac4c2f715531d/pkg/metrics/counter.go#L8-L10
+        // for consistency purpose (w.r.t. (dog)statsd source) they are turned back into counters
+        DatadogMetricType::Rate => dd_metric
+            .points
+            .iter()
+            .map(|dd_point| {
+                let i = dd_metric.interval.filter(|v| *v != 0).unwrap_or(1) as f64;
+                Metric::new(
+                    dd_metric.metric.clone(),
+                    MetricKind::Incremental,
+                    MetricValue::Counter {
+                        value: dd_point.1 * i,
+                    },
+                )
+                .with_timestamp(Some(Utc.timestamp(dd_point.0, 0)))
+                .with_tags(Some(tags.clone()))
+            })
+            .map(|mut metric| {
+                if let Some(k) = &api_key {
+                    metric
+                        .metadata_mut()
+                        .set_datadog_api_key(Some(Arc::clone(k)));
+                }
+                metric.into()
+            })
+            .collect(),
     }
 }
 
