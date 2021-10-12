@@ -168,6 +168,9 @@ impl DatadogAgentSource {
         header: Option<String>,
         query_params: Option<String>,
     ) -> Option<Arc<str>> {
+        if !self.store_api_key {
+            return None;
+        }
         // Grab from URL first
         self.api_key_matcher
             .captures(path)
@@ -237,14 +240,12 @@ impl DatadogAgentSource {
                       api_token: Option<String>,
                       query_params: ApiKeyQueryParams,
                       body: Bytes| {
-                    let token: Option<Arc<str>> = if self.store_api_key {
-                        self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key)
-                    } else {
-                        None
-                    };
-
-                    let events = decode(&encoding_header, body)
-                        .and_then(|body| self.decode_log_body(body, token));
+                    let events = decode(&encoding_header, body).and_then(|body| {
+                        self.decode_log_body(
+                            body,
+                            self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key),
+                        )
+                    });
                     Self::handle_request(events, acknowledgements, out.clone())
                 },
             )
@@ -265,13 +266,12 @@ impl DatadogAgentSource {
                       api_token: Option<String>,
                       query_params: ApiKeyQueryParams,
                       body: Bytes| {
-                    let token: Option<Arc<str>> = if self.store_api_key {
-                        self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key)
-                    } else {
-                        None
-                    };
-                    let events = decode(&encoding_header, body)
-                        .and_then(|body| self.decode_metric_body(body, token));
+                    let events = decode(&encoding_header, body).and_then(|body| {
+                        self.decode_datadog_series(
+                            body,
+                            self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key),
+                        )
+                    });
                     Self::handle_request(events, acknowledgements, out.clone())
                 },
             )
@@ -280,11 +280,15 @@ impl DatadogAgentSource {
 
     fn series_v2_service(self) -> BoxedFilter<(Response,)> {
         warp::post()
-            // This should not happen as the v2 series endpoint does not exist yet
+            // This should not happen anytime soon as the v2 series endpoint does not exist yet
             .and(path!("api" / "v2" / "series" / ..))
             .and_then(|| {
                 error!(message = "/api/v2/series route is not supported.");
-                let response: Result<Response, Rejection> = Ok(warp::reply().into_response());
+                let response: Result<Response, Rejection> =
+                    Err(warp::reject::custom(ErrorMessage::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Vector does not support the /api/v2/series route".to_string(),
+                    )));
                 future::ready(response)
             })
             .boxed()
@@ -300,34 +304,54 @@ impl DatadogAgentSource {
             .and(warp::body::bytes())
             .and_then(
                 move |path: FullPath,
-                 encoding_header: Option<String>,
-                 api_token: Option<String>,
-                 query_params: ApiKeyQueryParams,
-                 body: Bytes| {
+                      encoding_header: Option<String>,
+                      api_token: Option<String>,
+                      query_params: ApiKeyQueryParams,
+                      body: Bytes| {
                     error!(message = "/api/beta/sketches route is not yet fully supported.");
-                    let token: Option<Arc<str>> = if self.store_api_key {
-                        self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key)
-                    } else {
-                        None
-                    };
-                    let events = decode(&encoding_header, body)
-                        .and_then(|body| {
-                            decode_ddsketch(body, token).map_err(|error| {
-                                ErrorMessage::new(
-                                    StatusCode::UNPROCESSABLE_ENTITY,
-                                    format!("Error decoding Datadog sketch: {:?}", error),
-                                )
-                            })
-                        });
-                    //let response: Result<Response, Rejection> = Ok(warp::reply().into_response());
-                    //future::ready(response)
+
+                    let events = decode(&encoding_header, body).and_then(|body| {
+                        self.decode_datadog_sketches(
+                            body,
+                            self.extract_api_key(path.as_str(), api_token, query_params.dd_api_key),
+                        )
+                    });
                     Self::handle_request(events, acknowledgements, out.clone())
                 },
             )
             .boxed()
     }
 
-    fn decode_metric_body(
+    fn decode_datadog_sketches(
+        &self,
+        body: Bytes,
+        api_key: Option<Arc<str>>,
+    ) -> Result<Vec<Event>, ErrorMessage> {
+        if body.is_empty() {
+            // The datadog agent may send an empty payload as a keep alive
+            debug!(
+                message = "Empty payload ignored.",
+                internal_log_rate_secs = 30
+            );
+            return Ok(Vec::new());
+        }
+
+        let metrics = decode_ddsketch(body.clone(), api_key).map_err(|error| {
+            ErrorMessage::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Error decoding Datadog sketch: {:?}", error),
+            )
+        })?;
+
+        emit!(&DatadogAgentMetricDecoded {
+            byte_size: body.len(),
+            count: metrics.len(),
+        });
+
+        Ok(metrics)
+    }
+
+    fn decode_datadog_series(
         &self,
         body: Bytes,
         api_key: Option<Arc<str>>,
@@ -349,11 +373,6 @@ impl DatadogAgentSource {
                 )
             })?;
 
-        // Temporary
-        debug!(
-            metrics = "Deserialized datadog metric payload - /api/v1/series",
-           payload = ?metrics,
-        );
         emit!(&DatadogAgentMetricDecoded {
             byte_size: body.len(),
             count: metrics.series.len(),
