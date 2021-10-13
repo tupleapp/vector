@@ -1493,11 +1493,6 @@ mod tests {
     #[tokio::test]
     async fn compound_transform() {
         let config: ConfigBuilder = toml::from_str(indoc! {r#"
-            [transforms.test_input]
-              inputs = ["ignored"]
-              type = "remove_fields"
-              fields = ["timestamp"]
-
             [transforms.foo]
               inputs = ["test_input"]
               type = "compound"
@@ -1510,12 +1505,6 @@ mod tests {
                 type = "add_fields"
                 [transforms.foo.steps.fields]
                   foo = "barbaz"
-
-            [sinks.output]
-              type = "console"
-              inputs = [ "foo" ]
-              encoding = "json"
-              target = "stdout"
 
             [[tests]]
               name = "compound test"
@@ -1558,12 +1547,6 @@ mod tests {
                   name = "sum"
                   namespace = "ns"
 
-            [sinks.output]
-              type = "console"
-              inputs = [ "foo" ]
-              encoding = "json"
-              target = "stdout"
-
             [[tests]]
               name = "broken test"
 
@@ -1586,5 +1569,47 @@ mod tests {
                   failed to build transform 'foo': Inconsistent type in a compound transform"#}
             .to_owned(),]
         );
+    }
+
+    #[tokio::test]
+    async fn type_inconsistency_at_runtime_in_compound_transform() {
+        let config: ConfigBuilder = toml::from_str(indoc! {r#"
+            [transforms.foo]
+              inputs = ["input"]
+              type = "compound"
+              [[transforms.foo.steps]]
+                type = "add_fields"
+                [transforms.foo.steps.fields]
+                  foo = "bar"
+              [[transforms.foo.steps]]
+                type = "log_to_metric"
+                [[transforms.foo.steps.metrics]]
+                  type = "counter"
+                  field = "foo"
+                  name = "sum"
+                  namespace = "ns"
+              [[transforms.foo.steps]]
+                type = "filter"
+                condition = 'true'
+              [[transforms.foo.steps]]
+                type = "log_to_metric"
+                [[transforms.foo.steps.metrics]]
+                  type = "counter"
+                  field = "foo"
+                  name = "sum"
+                  namespace = "ns"
+
+            [[tests]]
+              name = "event dropped because of type inconsistency"
+              no_outputs_from = [ "foo" ]
+
+              [tests.input]
+                insert_at = "foo"
+                value = "nah this doesnt matter"
+        "#})
+        .unwrap();
+
+        let mut tests = build_unit_tests(config).await.unwrap();
+        assert_eq!(tests[0].run().1, Vec::<String>::new());
     }
 }
