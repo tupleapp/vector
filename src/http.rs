@@ -22,6 +22,7 @@ use tower::Service;
 use tracing_futures::Instrument;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility = "pub(crate)")]
 pub enum HttpError {
     #[snafu(display("Failed to build TLS connector: {}", source))]
     BuildTlsConnector { source: TlsError },
@@ -31,6 +32,8 @@ pub enum HttpError {
     MakeProxyConnector { source: InvalidUri },
     #[snafu(display("Failed to make HTTP(S) request: {}", source))]
     CallRequest { source: hyper::Error },
+    #[snafu(display("Failed to build HTTP request: {}", source))]
+    BuildRequest { source: http::Error },
 }
 
 pub type HttpClientFuture = <HttpClient as Service<http::Request<Body>>>::Future;
