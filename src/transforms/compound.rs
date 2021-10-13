@@ -24,25 +24,17 @@ impl GenerateConfig for CompoundConfig {
 
 impl CompoundConfig {
     fn consistent_types(&self) -> bool {
-        let mut it = self.steps.iter();
-        let mut p = match it.next() {
-            Some(p) => p,
-            None => {
-                return true;
-            }
-        };
-        for n in it {
-            match (p.output_type(), n.input_type()) {
-                (DataType::Log, DataType::Metric) => {
-                    return false;
-                }
-                (DataType::Metric, DataType::Log) => {
-                    return false;
-                }
-                _ => p = n,
-            };
-        }
-        true
+        let mut pairs = self.steps.windows(2).map(|items| match items {
+            [a, b] => (a.output_type(), b.input_type()),
+            _ => unreachable!(),
+        });
+
+        !pairs.any(|pair| {
+            matches!(
+                pair,
+                (DataType::Log, DataType::Metric) | (DataType::Metric, DataType::Log)
+            )
+        })
     }
 }
 
