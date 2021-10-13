@@ -116,7 +116,7 @@ impl TaskTransform for Compound {
                         errors.into_iter().for_each(|e| {
                             let event: serde_json::Value = e.try_into().unwrap_or_else(|_| json!("unable to render event"));
                             warn!(
-                                message = "A faillible function failed to process an event within a compound transform",
+                                message = "A faillible function failed to process an event within a compound transform.",
                                 %event
                             )
                         });
