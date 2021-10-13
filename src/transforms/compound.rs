@@ -1,10 +1,13 @@
 use crate::{
     config::{DataType, GenerateConfig, TransformConfig, TransformContext, TransformDescription},
     event::Event,
+    internal_events::CompoundErrorEvents,
     transforms::{TaskTransform, Transform},
 };
 use futures::{stream, Stream, StreamExt};
 use serde::{self, Deserialize, Serialize};
+use serde_json::json;
+use std::convert::TryInto;
 use std::pin::Pin;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -102,6 +105,22 @@ impl TaskTransform for Compound {
                     task = Box::pin(task.flat_map(move |v| {
                         let mut output = Vec::<Event>::new();
                         t.transform(&mut output, v);
+                        stream::iter(output)
+                    }));
+                }
+                Transform::FallibleFunction(mut t) => {
+                    task = Box::pin(task.flat_map(move |v| {
+                        let mut output = Vec::<Event>::new();
+                        let mut errors = Vec::<Event>::new();
+                        t.transform(&mut output, &mut errors, v);
+                        emit!(&CompoundErrorEvents { count: errors.len() });
+                        errors.into_iter().for_each(|e| {
+                            let event: serde_json::Value = e.try_into().unwrap_or(json!("unable to render event"));
+                            warn!(
+                                message = "A faillible function failed to process an event within a compound transform",
+                                %event
+                            )
+                        });
                         stream::iter(output)
                     }));
                 }
