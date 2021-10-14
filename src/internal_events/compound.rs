@@ -8,7 +8,7 @@ pub struct CompoundErrorEvents {
 
 impl InternalEvent for CompoundErrorEvents {
     fn emit_metrics(&self) {
-        counter!("compound_error_events_total", self.count as u64);
+        counter!("processing_errors_total", self.count as u64, "error_type" => "transform_failed");
     }
 }
 
@@ -17,6 +17,6 @@ pub struct CompoundTypeMismatchEventDropped {}
 
 impl InternalEvent for CompoundTypeMismatchEventDropped {
     fn emit_metrics(&self) {
-        counter!("compound_type_mismatch_events_dropped_total", 1);
+        counter!("events_discarded_total", 1);
     }
 }
