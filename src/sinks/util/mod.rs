@@ -35,7 +35,7 @@ pub use buffer::{Buffer, Compression, PartitionBuffer, PartitionInnerBuffer};
 pub use builder::SinkBuilderExt;
 pub use compressor::Compressor;
 pub use normalizer::Normalizer;
-pub use request_builder::{RequestBuilder, StatefulRequestBuilder};
+pub use request_builder::{RequestBuilder, IncrementalRequestBuilder};
 pub use service::{
     Concurrency, ServiceBuilderExt, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestLayer, TowerRequestSettings,
