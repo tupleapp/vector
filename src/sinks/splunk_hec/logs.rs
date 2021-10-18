@@ -356,6 +356,7 @@ mod integration_tests {
     use crate::{
         config::{SinkConfig, SinkContext},
         sinks::splunk_hec::conn::integration_test_helpers::get_token,
+        test_util::components::{self, HTTP_SINK_TAGS},
         test_util::{random_lines_with_stream, random_string},
     };
     use futures::stream;
@@ -397,7 +398,7 @@ mod integration_tests {
             .with_batch_notifier(&batch)
             .into();
         drop(batch);
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
         assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
 
         let entry = find_entry(message.as_str()).await;
@@ -435,7 +436,7 @@ mod integration_tests {
 
         let message = random_string(100);
         let event = Event::from(message.clone());
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -452,7 +453,7 @@ mod integration_tests {
 
         let message = random_string(100);
         let event = Event::from(message.clone());
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -472,7 +473,7 @@ mod integration_tests {
         let message = random_string(100);
         let mut event = Event::from(message.clone());
         event.as_mut_log().insert("index_name", "custom_index");
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -488,7 +489,7 @@ mod integration_tests {
         let (sink, _) = config.build(cx).await.unwrap();
 
         let (messages, events) = random_lines_with_stream(100, 10, None);
-        sink.run(events).await.unwrap();
+        components::run_sink(sink, events, &HTTP_SINK_TAGS).await;
 
         let mut found_all = false;
         for _ in 0..20 {
@@ -521,7 +522,7 @@ mod integration_tests {
         let message = random_string(100);
         let mut event = Event::from(message.clone());
         event.as_mut_log().insert("asdf", "hello");
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -542,7 +543,7 @@ mod integration_tests {
         let mut event = Event::from(message.clone());
         event.as_mut_log().insert("asdf", "hello");
         event.as_mut_log().insert("host", "example.com:1234");
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -566,7 +567,7 @@ mod integration_tests {
         let message = random_string(100);
         let mut event = Event::from(message.clone());
         event.as_mut_log().insert("asdf", "hello");
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 
@@ -593,7 +594,7 @@ mod integration_tests {
         event.as_mut_log().insert("asdf", "hello");
         event.as_mut_log().insert("host", "example.com:1234");
         event.as_mut_log().insert("roast", "beef.example.com:1234");
-        sink.run(stream::once(ready(event))).await.unwrap();
+        components::run_sink_event(sink, event, &HTTP_SINK_TAGS).await;
 
         let entry = find_entry(message.as_str()).await;
 

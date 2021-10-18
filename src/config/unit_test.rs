@@ -513,11 +513,7 @@ async fn build_unit_test(
                     );
                 }
                 Err(err) => {
-                    errors.push(format!(
-                        "failed to build transform '{}': {:#}",
-                        id,
-                        anyhow::anyhow!(err)
-                    ));
+                    errors.push(format!("failed to build transform '{}': {:#}", id, err));
                 }
             }
         }
@@ -578,6 +574,8 @@ async fn build_unit_test(
             "unit test must contain at least one of `outputs` or `no_outputs_from`.".to_owned(),
         );
     }
+
+    enrichment_tables.finish_load();
 
     if !errors.is_empty() {
         Err(errors)
