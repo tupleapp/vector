@@ -5,6 +5,7 @@ pub mod builder;
 pub mod compressor;
 pub mod encoding;
 pub mod http;
+pub mod normalizer;
 pub mod request_builder;
 pub mod retries;
 pub mod service;
@@ -18,7 +19,6 @@ pub mod udp;
 #[cfg(all(any(feature = "sinks-socket", feature = "sinks-statsd"), unix))]
 pub mod unix;
 pub mod uri;
-pub mod normalizer;
 
 use crate::event::{Event, EventFinalizers};
 use bytes::Bytes;
@@ -35,7 +35,7 @@ pub use buffer::{Buffer, Compression, PartitionBuffer, PartitionInnerBuffer};
 pub use builder::SinkBuilderExt;
 pub use compressor::Compressor;
 pub use normalizer::Normalizer;
-pub use request_builder::{RequestBuilder, IncrementalRequestBuilder};
+pub use request_builder::{IncrementalRequestBuilder, RequestBuilder};
 pub use service::{
     Concurrency, ServiceBuilderExt, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestLayer, TowerRequestSettings,

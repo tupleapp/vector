@@ -1,7 +1,6 @@
-use crate::{
-    http::HttpClient,
-    sinks::{HealthcheckError, UriParseError},
-};
+use crate::sinks::UriParseError;
+use crate::{http::HttpClient, sinks::HealthcheckError};
+
 use http::{Request, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -10,7 +9,7 @@ use std::sync::Arc;
 pub mod events;
 pub mod logs;
 pub mod metrics;
-pub mod metrics2;
+//pub mod metrics2;
 
 type ApiKey = Arc<str>;
 

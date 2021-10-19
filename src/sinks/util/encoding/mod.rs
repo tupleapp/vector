@@ -58,7 +58,7 @@
 //! accomplish this without a bunch of magic.  [`EncodingConfigFixed`] goes a step further and
 //! provides a way to force a codec, disallowing an override from being specified.
 mod codec;
-pub use codec::{StandardEncodings, StandardJsonEncoding, StandardTextEncoding};
+pub use codec::{as_tracked_write, StandardEncodings, StandardJsonEncoding, StandardTextEncoding};
 mod config;
 pub use config::EncodingConfig;
 mod fixed;
@@ -76,9 +76,9 @@ use std::{fmt::Debug, io, sync::Arc};
 
 pub trait Encoder<T> {
     /// Encodes the input into the provided writer.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// If an I/O error is encountered while encoding the input, an error variant will be returned.
     fn encode_input(&self, input: T, writer: &mut dyn io::Write) -> io::Result<usize>;
 }
@@ -90,32 +90,6 @@ where
     fn encode_input(&self, input: T, writer: &mut dyn io::Write) -> io::Result<usize> {
         (**self).encode_input(input, writer)
     }
-}
-
-pub trait StatefulEncoder<T> {
-    type Payload;
-
-    /// Attempts to encode the input.
-    ///
-    /// If the encoder was able to successfully encode and store the input, then `Ok(None)` will be
-    /// returned.  Otherwise, `Ok(Some(T))` will be returned, handing back to input that was not
-    /// asble to be encoded.  When this occurs, further calls to `try_encode` will not succeed, and
-    /// callers should finalize this encoder by calling `finish`.
-    ///
-    /// # Errors
-    ///
-    /// If an I/O error is encounted while encoding the input, an error variant will be returned.
-    fn try_encode(&mut self, input: T) -> io::Result<Option<T>>;
-
-    /// Finalizes the encoder, returning the payload containing the encoded inputs.
-    /// 
-    /// If the encoder fails to finalize the payload for a non-I/O error related reason, then
-    /// `Ok(None)` will be returned.  Otherwise, `Ok(Some(Self::Payload))` will be returned.
-    /// 
-    /// # Errors
-    /// 
-    /// If an I/O error is encountered while finalizing the payload, an error variant will be returned.
-    fn finish(self) -> io::Result<Option<Self::Payload>>;
 }
 
 /// The behavior of a encoding configuration.
