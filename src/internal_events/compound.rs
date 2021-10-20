@@ -11,12 +11,3 @@ impl InternalEvent for CompoundErrorEvents {
         counter!("processing_errors_total", self.count as u64, "error_type" => "transform_failed");
     }
 }
-
-#[derive(Debug)]
-pub struct CompoundTypeMismatchEventDropped {}
-
-impl InternalEvent for CompoundTypeMismatchEventDropped {
-    fn emit_metrics(&self) {
-        counter!("events_discarded_total", 1);
-    }
-}

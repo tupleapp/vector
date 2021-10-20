@@ -1,13 +1,13 @@
 use crate::{
     config::{DataType, GenerateConfig, TransformConfig, TransformContext, TransformDescription},
     event::Event,
-    internal_events::{CompoundErrorEvents, CompoundTypeMismatchEventDropped},
+    internal_events::CompoundErrorEvents,
+    topology::builder::filter_event_type,
     transforms::{TaskTransform, Transform},
 };
 use futures::{stream, Stream, StreamExt};
 use serde::{self, Deserialize, Serialize};
-use serde_json::json;
-use std::{convert::TryInto, future::ready, pin::Pin};
+use std::pin::Pin;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CompoundConfig {
@@ -77,7 +77,7 @@ impl Compound {
         if !steps.is_empty() {
             for transform_config in steps.iter() {
                 let transform = transform_config.build(context).await?;
-                transforms.push((transform, transform_config.input_type()));
+                transforms.push((transform, config.input_type()));
             }
             Ok(Self { transforms })
         } else {
@@ -98,52 +98,34 @@ impl TaskTransform for Compound {
         for t in self.transforms {
             match t {
                 (Transform::Task(t), input_type) => {
-                    task = t.transform(type_filter(task, input_type));
+                    task = t.transform(filter_event_type(Box::pin(task), input_type));
                 }
                 (Transform::Function(mut t), input_type) => {
-                    task = Box::pin(type_filter(task, input_type).flat_map(move |v| {
-                        let mut output = Vec::<Event>::new();
-                        t.transform(&mut output, v);
-                        stream::iter(output)
-                    }));
+                    task = Box::pin(filter_event_type(Box::pin(task), input_type).flat_map(
+                        move |v| {
+                            let mut output = Vec::<Event>::new();
+                            t.transform(&mut output, v);
+                            stream::iter(output)
+                        },
+                    ));
                 }
                 (Transform::FallibleFunction(mut t), input_type) => {
-                    task = Box::pin(type_filter(task, input_type).flat_map(move |v| {
-                        let mut output = Vec::<Event>::new();
-                        let mut errors = Vec::<Event>::new();
-                        t.transform(&mut output, &mut errors, v);
-                        emit!(&CompoundErrorEvents { count: errors.len()});
-                        errors.into_iter().for_each(|e| {
-                            let event: serde_json::Value = e.try_into().unwrap_or_else(|_| json!("unable to render event"));
-                            warn!(
-                                message = "A faillible function failed to process an event within a compound transform.",
-                                %event
-                            )
-                        });
-                        stream::iter(output)
-                    }));
+                    task = Box::pin(filter_event_type(Box::pin(task), input_type).flat_map(
+                        move |v| {
+                            let mut output = Vec::<Event>::new();
+                            let mut errors = Vec::<Event>::new();
+                            t.transform(&mut output, &mut errors, v);
+                            emit!(&CompoundErrorEvents {
+                                count: errors.len(),
+                            });
+                            stream::iter(output)
+                        },
+                    ));
                 }
             }
         }
         task
     }
-}
-
-fn type_filter(
-    task: Pin<Box<dyn Stream<Item = Event> + Send>>,
-    data_type: DataType,
-) -> Pin<Box<dyn Stream<Item = Event> + Send>> {
-    Box::pin(task.filter(move |e| {
-        if match data_type {
-            DataType::Any => true,
-            DataType::Log => matches!(e, Event::Log(_)),
-            DataType::Metric => matches!(e, Event::Metric(_)),
-        } {
-            return ready(true);
-        }
-        emit!(&CompoundTypeMismatchEventDropped {});
-        ready(false)
-    }))
 }
 
 #[cfg(test)]
