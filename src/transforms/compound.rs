@@ -77,7 +77,7 @@ impl Compound {
         if !steps.is_empty() {
             for transform_config in steps.iter() {
                 let transform = transform_config.build(context).await?;
-                transforms.push((transform, config.input_type()));
+                transforms.push((transform, transform_config.input_type()));
             }
             Ok(Self { transforms })
         } else {
@@ -96,12 +96,13 @@ impl TaskTransform for Compound {
     {
         let mut task = task;
         for t in self.transforms {
-            match t {
-                (Transform::Task(t), input_type) => {
-                    task = t.transform(filter_event_type(Box::pin(task), input_type));
+            task = filter_event_type(Box::pin(task), t.1);
+            match t.0 {
+                Transform::Task(t) => {
+                    task = t.transform(task);
                 }
-                (Transform::Function(mut t), input_type) => {
-                    task = Box::pin(filter_event_type(Box::pin(task), input_type).flat_map(
+                Transform::Function(mut t) => {
+                    task = Box::pin(task.flat_map(
                         move |v| {
                             let mut output = Vec::<Event>::new();
                             t.transform(&mut output, v);
@@ -109,8 +110,8 @@ impl TaskTransform for Compound {
                         },
                     ));
                 }
-                (Transform::FallibleFunction(mut t), input_type) => {
-                    task = Box::pin(filter_event_type(Box::pin(task), input_type).flat_map(
+                Transform::FallibleFunction(mut t) => {
+                    task = Box::pin(task.flat_map(
                         move |v| {
                             let mut output = Vec::<Event>::new();
                             let mut errors = Vec::<Event>::new();
