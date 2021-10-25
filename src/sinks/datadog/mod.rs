@@ -12,7 +12,6 @@ pub mod events;
 pub mod logs;
 #[cfg(feature = "sinks-datadog_metrics")]
 pub mod metrics;
-//pub mod metrics2;
 
 type ApiKey = Arc<str>;
 
