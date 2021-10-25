@@ -1,7 +1,10 @@
+ARG RUST_VERSION=1.55
+ARG DEBIAN_VERSION=bullseye
+
 #
 # BUILDER
 #
-FROM docker.io/rust:1.55-buster as builder
+FROM docker.io/rust:${RUST_VERSION}-${DEBIAN_VERSION} as builder
 WORKDIR vector
 ARG VECTOR_FEATURES
 RUN apt-get -y update && apt-get -y install build-essential cmake libclang-dev libsasl2-dev
