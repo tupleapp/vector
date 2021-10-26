@@ -46,7 +46,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: ${{ steps.features.outputs.FEATURES }}
+          build-args: |
+            VECTOR_FEATURES=${{ steps.features.outputs.FEATURES }}
 
   observer:
     name: Build and push 'observer' to Github CR
