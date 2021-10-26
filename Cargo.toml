@@ -565,6 +565,7 @@ transforms-tokenizer = []
 # Sinks
 sinks = ["sinks-logs", "sinks-metrics"]
 sinks-logs = [
+  "sinks-apex",
   "sinks-aws_cloudwatch_logs",
   "sinks-aws_kinesis_firehose",
   "sinks-aws_kinesis_streams",
@@ -612,6 +613,7 @@ sinks-metrics = [
   "sinks-splunk_hec"
 ]
 
+sinks-apex = []
 sinks-aws_cloudwatch_logs = ["rusoto", "rusoto_logs"]
 sinks-aws_cloudwatch_metrics = ["rusoto", "rusoto_cloudwatch"]
 sinks-aws_kinesis_firehose = ["rusoto", "rusoto_firehose"]
