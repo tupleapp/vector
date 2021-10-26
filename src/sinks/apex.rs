@@ -2,11 +2,11 @@ use crate::{
     config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
     event::Event,
     http::{Auth, HttpClient, MaybeAuth},
-    internal_events::{HttpEventEncoded, HttpEventMissingMessage},
     sinks::util::{
         encoding::{EncodingConfig, EncodingConfiguration},
         http::{BatchedHttpSink, HttpSink, RequestConfig},
-        BatchConfig, BatchSettings, Buffer, Compression, TowerRequestConfig, UriSerde,
+        BatchConfig, BatchSettings, BoxedRawValue, Compression, JsonArrayBuffer,
+        TowerRequestConfig, UriSerde,
     },
     tls::{TlsOptions, TlsSettings},
 };
@@ -20,6 +20,7 @@ use hyper::Body;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use serde_json::value::Value;
 use snafu::{ResultExt, Snafu};
 use std::io::Write;
 
@@ -151,13 +152,13 @@ impl SinkConfig for ApexSinkConfig {
             .unwrap_with(&TowerRequestConfig::default());
         let sink = BatchedHttpSink::new(
             config,
-            Buffer::new(batch.size, Compression::None),
+            JsonArrayBuffer::new(batch.size),
             request,
             batch.timeout,
             client,
             cx.acker(),
         )
-        .sink_map_err(|error| error!(message = "Fatal HTTP sink error.", %error));
+        .sink_map_err(|error| error!(message = "Fatal Apex sink error.", %error));
 
         let sink = super::VectorSink::Sink(Box::new(sink));
 
@@ -175,50 +176,19 @@ impl SinkConfig for ApexSinkConfig {
 
 #[async_trait::async_trait]
 impl HttpSink for ApexSinkConfig {
-    type Input = Vec<u8>;
-    type Output = Vec<u8>;
+    type Input = Value;
+    type Output = Vec<BoxedRawValue>;
 
     fn encode_event(&self, mut event: Event) -> Option<Self::Input> {
         self.encoding.apply_rules(&mut event);
         let event = event.into_log();
 
-        let body = match &self.encoding.codec() {
-            Encoding::Text => {
-                if let Some(v) = event.get(crate::config::log_schema().message_key()) {
-                    let mut b = v.to_string_lossy().into_bytes();
-                    b.push(b'\n');
-                    b
-                } else {
-                    emit!(&HttpEventMissingMessage);
-                    return None;
-                }
-            }
-
-            Encoding::Ndjson => {
-                let mut b = serde_json::to_vec(&event)
-                    .map_err(|error| panic!("Unable to encode into JSON: {}", error))
-                    .ok()?;
-                b.push(b'\n');
-                b
-            }
-
-            Encoding::Json => {
-                let mut b = serde_json::to_vec(&event)
-                    .map_err(|error| panic!("Unable to encode into JSON: {}", error))
-                    .ok()?;
-                b.push(b',');
-                b
-            }
-        };
-
-        emit!(&HttpEventEncoded {
-            byte_size: body.len(),
-        });
+        let body = json!(&event);
 
         Some(body)
     }
 
-    async fn build_request(&self, mut body: Self::Output) -> crate::Result<http::Request<Vec<u8>>> {
+    async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Vec<u8>>> {
         let method = match &self.method.clone().unwrap_or(HttpMethod::Post) {
             HttpMethod::Get => Method::GET,
             HttpMethod::Head => Method::HEAD,
@@ -237,15 +207,14 @@ impl HttpSink for ApexSinkConfig {
             Encoding::Json => "application/json",
         };
 
-        body.pop(); // remove trailing comma from last record
         let full_body_string = json!({
             "project_id": self.project_id,
-            "events": [body]
+            "events": events
         });
 
         debug!("{}", full_body_string.as_str().unwrap());
 
-        body = serde_json::to_vec(&full_body_string).unwrap();
+        let body = serde_json::to_vec(&full_body_string).unwrap();
 
         let mut builder = Request::builder()
             .method(method)
