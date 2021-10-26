@@ -35,6 +35,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
         with:
+          labels: |
+            soak_test_name=datadog_agent_remap_datadog_logs
           images: ghcr.io/${{ github.repository }}/soak-vector
           tags: type=raw, value=${{ steps.flag_sha.outputs.FEATURE_SHA }}-${{ github.sha }}
 
