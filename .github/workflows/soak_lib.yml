@@ -18,6 +18,12 @@ jobs:
           echo "::set-output name=FEATURE_SHA::$(echo -n "${FEATURES}" | sha256sum - | head -c40)"
         id: flag_sha
 
+      - name: Compute feature flags
+        run: |
+          . "soaks/datadog_agent_remap_datadog_logs/FEATURES"
+          echo "::set-output name=FEATURES::$(echo "${FEATURES}")"
+        id: features
+
       - name: Log in to the Container registry
         uses: docker/login-action@f054a8b539a109f9f41c372932f1ae047eff08c9
         with:
@@ -40,6 +46,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.features.outputs.FEATURES }}
 
   observer:
     name: Build and push 'observer' to Github CR
