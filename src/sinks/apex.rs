@@ -243,6 +243,8 @@ impl HttpSink for ApexSinkConfig {
             "events": [body]
         });
 
+        debug!("{}", full_body_string.as_str().unwrap());
+
         body = serde_json::to_vec(&full_body_string).unwrap();
 
         let mut builder = Request::builder()
