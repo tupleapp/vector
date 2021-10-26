@@ -7,7 +7,7 @@ on: push
 jobs:
   vector-soak:
     name: Build and push 'soak-vector' to Github CR
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, general]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v2
