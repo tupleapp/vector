@@ -1,99 +1,54 @@
 use crate::{
-    config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
-    event::Event,
-    http::{Auth, HttpClient, MaybeAuth},
-    sinks::util::{
-        encoding::{EncodingConfig, EncodingConfiguration},
-        http::{BatchedHttpSink, HttpSink, RequestConfig},
-        BatchConfig, BatchSettings, BoxedRawValue, Compression, JsonArrayBuffer,
-        TowerRequestConfig, UriSerde,
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, SinkDescription,
     },
-    tls::{TlsOptions, TlsSettings},
+    event::Event,
+    http::{Auth, HttpClient},
+    sinks::util::{
+        encoding::Transformer,
+        http::{BatchedHttpSink, HttpEventEncoder, HttpSink},
+        BatchConfig, BoxedRawValue, JsonArrayBuffer, SinkBatchSettings, TowerRequestConfig,
+        UriSerde,
+    },
 };
-use flate2::write::GzEncoder;
-use futures::{future, FutureExt, SinkExt};
-use http::{
-    header::{self, HeaderName, HeaderValue},
-    Method, Request, StatusCode, Uri,
-};
+use bytes::Bytes;
+use futures::{FutureExt, SinkExt};
+use http::{Request, StatusCode, Uri};
 use hyper::Body;
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::value::Value;
-use snafu::{ResultExt, Snafu};
-use std::io::Write;
-
-#[derive(Debug, Snafu)]
-enum BuildError {
-    #[snafu(display("{}: {}", source, name))]
-    InvalidHeaderName {
-        name: String,
-        source: header::InvalidHeaderName,
-    },
-    #[snafu(display("{}: {}", source, value))]
-    InvalidHeaderValue {
-        value: String,
-        source: header::InvalidHeaderValue,
-    },
-}
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ApexSinkConfig {
     pub uri: UriSerde,
     pub project_id: String,
-    pub method: Option<HttpMethod>,
     pub auth: Option<Auth>,
-    // Deprecated, moved to request.
-    pub headers: Option<IndexMap<String, String>>,
     #[serde(default)]
-    pub compression: Compression,
-    pub encoding: EncodingConfig<Encoding>,
+    pub batch: BatchConfig<ApexDefaultBatchSettings>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+    )]
+    encoding: Transformer,
     #[serde(default)]
-    pub batch: BatchConfig,
-    #[serde(default)]
-    pub request: RequestConfig,
-    pub tls: Option<TlsOptions>,
+    request: TowerRequestConfig,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+    )]
+    acknowledgements: AcknowledgementsConfig,
 }
 
-#[cfg(test)]
-fn default_config(e: Encoding) -> ApexSinkConfig {
-    ApexSinkConfig {
-        uri: Default::default(),
-        project_id: Default::default(),
-        method: Default::default(),
-        auth: Default::default(),
-        headers: Default::default(),
-        compression: Default::default(),
-        batch: Default::default(),
-        encoding: e.into(),
-        request: Default::default(),
-        tls: Default::default(),
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApexDefaultBatchSettings;
 
-#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone, Derivative)]
-#[serde(rename_all = "snake_case")]
-#[derivative(Default)]
-pub enum HttpMethod {
-    #[derivative(Default)]
-    Get,
-    Head,
-    Post,
-    Put,
-    Delete,
-    Options,
-    Trace,
-    Patch,
-}
-
-#[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum Encoding {
-    Text,
-    Ndjson,
-    Json,
+impl SinkBatchSettings for ApexDefaultBatchSettings {
+    const MAX_EVENTS: Option<usize> = None;
+    const MAX_BYTES: Option<usize> = Some(100_000);
+    const TIMEOUT_SECS: f64 = 5.0;
 }
 
 inventory::submit! {
@@ -102,18 +57,7 @@ inventory::submit! {
 
 impl GenerateConfig for ApexSinkConfig {
     fn generate_config() -> toml::Value {
-        toml::from_str(
-            r#"uri = "https://10.22.212.22:9000/endpoint"
-            encoding.codec = "json""#,
-        )
-        .unwrap()
-    }
-}
-
-impl ApexSinkConfig {
-    fn build_http_client(&self, cx: &SinkContext) -> crate::Result<HttpClient> {
-        let tls = TlsSettings::from_options(&self.tls)?;
-        Ok(HttpClient::new(tls, cx.proxy())?)
+        toml::from_str(r#"uri = "https://10.22.212.22:9000/endpoint""#).unwrap()
     }
 }
 
@@ -124,53 +68,50 @@ impl SinkConfig for ApexSinkConfig {
         &self,
         cx: SinkContext,
     ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
-        let client = self.build_http_client(&cx)?;
+        let request_settings = self.request.unwrap_with(&TowerRequestConfig::default());
+        let batch_settings = self.batch.into_batch_settings()?;
+        let buffer = JsonArrayBuffer::new(batch_settings.size);
+        let client = HttpClient::new(None, cx.proxy())?;
 
-        let healthcheck = match cx.healthcheck.uri.clone() {
-            Some(healthcheck_uri) => {
-                healthcheck(healthcheck_uri, self.auth.clone(), client.clone()).boxed()
-            }
-            None => future::ok(()).boxed(),
-        };
-
-        let mut config = ApexSinkConfig {
-            auth: self.auth.choose_one(&self.uri.auth)?,
-            uri: self.uri.with_default_parts(),
-            ..self.clone()
-        };
-
-        config.request.add_old_option(config.headers.take());
-        validate_headers(&config.request.headers, &config.auth)?;
-
-        let batch = BatchSettings::default()
-            .bytes(10_000_000)
-            .timeout(1)
-            .parse_config(config.batch)?;
-        let request = config
-            .request
-            .tower
-            .unwrap_with(&TowerRequestConfig::default());
         let sink = BatchedHttpSink::new(
-            config,
-            JsonArrayBuffer::new(batch.size),
-            request,
-            batch.timeout,
-            client,
+            self.clone(),
+            buffer,
+            request_settings,
+            batch_settings.timeout,
+            client.clone(),
             cx.acker(),
         )
-        .sink_map_err(|error| error!(message = "Fatal Apex sink error.", %error));
+        .sink_map_err(|error| error!(message = "Fatal apex sink error.", %error));
 
-        let sink = super::VectorSink::Sink(Box::new(sink));
+        let healthcheck = healthcheck(self.clone(), client).boxed();
 
-        Ok((sink, healthcheck))
+        Ok((super::VectorSink::from_event_sink(sink), healthcheck))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
     fn sink_type(&self) -> &'static str {
         "apex"
+    }
+
+    fn acknowledgements(&self) -> Option<&AcknowledgementsConfig> {
+        Some(&self.acknowledgements)
+    }
+}
+
+pub struct ApexEventEncoder {
+    transformer: Transformer,
+}
+
+impl HttpEventEncoder<serde_json::Value> for ApexEventEncoder {
+    fn encode_event(&mut self, mut event: Event) -> Option<serde_json::Value> {
+        self.transformer.transform(&mut event);
+        let event = event.into_log();
+        let body = json!(&event);
+
+        Some(body)
     }
 }
 
@@ -178,62 +119,26 @@ impl SinkConfig for ApexSinkConfig {
 impl HttpSink for ApexSinkConfig {
     type Input = Value;
     type Output = Vec<BoxedRawValue>;
+    type Encoder = ApexEventEncoder;
 
-    fn encode_event(&self, mut event: Event) -> Option<Self::Input> {
-        self.encoding.apply_rules(&mut event);
-        let event = event.into_log();
-
-        let body = json!(&event);
-
-        Some(body)
+    fn build_encoder(&self) -> Self::Encoder {
+        ApexEventEncoder {
+            transformer: self.encoding.clone(),
+        }
     }
 
-    async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Vec<u8>>> {
-        let method = match &self.method.clone().unwrap_or(HttpMethod::Post) {
-            HttpMethod::Get => Method::GET,
-            HttpMethod::Head => Method::HEAD,
-            HttpMethod::Post => Method::POST,
-            HttpMethod::Put => Method::PUT,
-            HttpMethod::Delete => Method::DELETE,
-            HttpMethod::Options => Method::OPTIONS,
-            HttpMethod::Trace => Method::TRACE,
-            HttpMethod::Patch => Method::PATCH,
-        };
+    async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Bytes>> {
         let uri: Uri = self.uri.uri.clone();
-
-        let ct = match self.encoding.codec() {
-            Encoding::Text => "text/plain",
-            Encoding::Ndjson => "application/x-ndjson",
-            Encoding::Json => "application/json",
-        };
 
         let full_body_string = json!({
             "project_id": self.project_id,
             "events": events
         });
 
-        let mut body = serde_json::to_vec(&full_body_string).unwrap();
-
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("Content-Type", ct);
-
-        match self.compression {
-            Compression::Gzip(level) => {
-                builder = builder.header("Content-Encoding", "gzip");
-
-                let mut w = GzEncoder::new(Vec::new(), level);
-                w.write_all(&body).expect("Writing to Vec can't fail");
-                body = w.finish().expect("Writing to Vec can't fail");
-            }
-            Compression::None => {}
-        }
-
-        for (header, value) in self.request.headers.iter() {
-            builder = builder.header(header.as_str(), value.as_str());
-        }
-
+        let body = crate::serde::json::to_bytes(&full_body_string)
+            .unwrap()
+            .freeze();
+        let builder = Request::post(uri).header("Content-Type", "application/json");
         let mut request = builder.body(body).unwrap();
 
         if let Some(auth) = &self.auth {
@@ -244,12 +149,11 @@ impl HttpSink for ApexSinkConfig {
     }
 }
 
-async fn healthcheck(uri: UriSerde, auth: Option<Auth>, client: HttpClient) -> crate::Result<()> {
-    let auth = auth.choose_one(&uri.auth)?;
-    let uri = uri.with_default_parts();
+async fn healthcheck(config: ApexSinkConfig, client: HttpClient) -> crate::Result<()> {
+    let uri = config.uri.with_default_parts();
     let mut request = Request::head(&uri.uri).body(Body::empty()).unwrap();
 
-    if let Some(auth) = auth {
+    if let Some(auth) = config.auth {
         auth.apply(&mut request);
     }
 
@@ -259,17 +163,4 @@ async fn healthcheck(uri: UriSerde, auth: Option<Auth>, client: HttpClient) -> c
         StatusCode::OK => Ok(()),
         status => Err(super::HealthcheckError::UnexpectedStatus { status }.into()),
     }
-}
-
-fn validate_headers(map: &IndexMap<String, String>, auth: &Option<Auth>) -> crate::Result<()> {
-    for (name, value) in map {
-        if auth.is_some() && name.eq_ignore_ascii_case("Authorization") {
-            return Err("Authorization header can not be used with defined auth options".into());
-        }
-
-        HeaderName::from_bytes(name.as_bytes()).with_context(|| InvalidHeaderName { name })?;
-        HeaderValue::from_bytes(value.as_bytes()).with_context(|| InvalidHeaderValue { value })?;
-    }
-
-    Ok(())
 }
