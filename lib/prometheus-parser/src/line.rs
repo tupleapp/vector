@@ -1,5 +1,7 @@
 //! Parse a single line of Prometheus text format.
 
+use std::collections::BTreeMap;
+
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_while, take_while1},
@@ -10,7 +12,6 @@ use nom::{
     number::complete::double,
     sequence::{delimited, pair, preceded, tuple},
 };
-use std::collections::BTreeMap;
 
 /// We try to catch all nom's `ErrorKind` with our own `ErrorKind`,
 /// to provide a meaningful error message.
@@ -393,8 +394,9 @@ fn match_char(c: char) -> impl Fn(&str) -> IResult<char> {
 
 #[cfg(test)]
 mod test {
+    use vector_common::btreemap;
+
     use super::*;
-    use shared::btreemap;
 
     #[test]
     fn test_parse_escaped_string() {
@@ -585,17 +587,17 @@ mod test {
         let input = wrap("{}");
         let (left, r) = Metric::parse_labels(&input).unwrap();
         assert_eq!(left, tail);
-        assert_eq!(r, btreemap! {});
+        assert_eq!(r, BTreeMap::new());
 
         let input = wrap(r#"{name="value"}"#);
         let (left, r) = Metric::parse_labels(&input).unwrap();
         assert_eq!(left, tail);
-        assert_eq!(r, btreemap! { "name" => "value" });
+        assert_eq!(r, BTreeMap::from([("name".into(), "value".into())]));
 
         let input = wrap(r#"{name="value",}"#);
         let (left, r) = Metric::parse_labels(&input).unwrap();
         assert_eq!(left, tail);
-        assert_eq!(r, btreemap! { "name" => "value" });
+        assert_eq!(r, BTreeMap::from([("name".into(), "value".into())]));
 
         let input = wrap(r#"{ name = "" ,b="a=b" , a="},", _c = "\""}"#);
         let (left, r) = Metric::parse_labels(&input).unwrap();
@@ -608,7 +610,7 @@ mod test {
         let input = wrap("100");
         let (left, r) = Metric::parse_labels(&input).unwrap();
         assert_eq!(left, "100".to_owned() + tail);
-        assert_eq!(r, btreemap! {});
+        assert_eq!(r, BTreeMap::new());
 
         // We don't allow these values
 

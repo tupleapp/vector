@@ -1,51 +1,50 @@
-use crate::http::{Auth, HttpClient, MaybeAuth};
-use crate::sinks::elasticsearch::{
-    finish_signer, ElasticSearchAuth, ElasticSearchCommonMode, ElasticSearchConfig, ParseError,
-};
-use crate::transforms::metric_to_log::MetricToLog;
-
-use crate::sinks::util::http::RequestConfig;
-
-use crate::rusoto::region_from_endpoint;
-use crate::sinks::util::{Compression, TowerRequestConfig, UriSerde};
-use crate::tls::TlsSettings;
-use http::{StatusCode, Uri};
-use hyper::Body;
-use rusoto_signature::SignedRequest;
-use snafu::ResultExt;
-use std::convert::TryFrom;
-
-use super::{InvalidHost, Request};
-use crate::rusoto;
-use crate::sinks::elasticsearch::encoder::ElasticSearchEncoder;
-use crate::sinks::util::encoding::EncodingConfigFixed;
-use crate::sinks::HealthcheckError;
-use rusoto_core::Region;
 use std::collections::HashMap;
+use std::time::SystemTime;
+
+use aws_sigv4::http_request::{SignableRequest, SigningSettings};
+use aws_sigv4::SigningParams;
+use aws_types::credentials::{ProvideCredentials, SharedCredentialsProvider};
+use aws_types::region::Region;
+use bytes::Bytes;
+use http::{StatusCode, Uri};
+use snafu::ResultExt;
+
+use super::{
+    request_builder::ElasticsearchRequestBuilder, ElasticsearchEncoder, InvalidHostSnafu, Request,
+};
+use crate::{
+    http::{Auth, HttpClient, MaybeAuth},
+    sinks::{
+        elasticsearch::{
+            ElasticsearchAuth, ElasticsearchCommonMode, ElasticsearchConfig, ParseError,
+        },
+        util::{http::RequestConfig, TowerRequestConfig, UriSerde},
+        HealthcheckError,
+    },
+    tls::TlsSettings,
+    transforms::metric_to_log::MetricToLog,
+};
 
 #[derive(Debug)]
-pub struct ElasticSearchCommon {
+pub struct ElasticsearchCommon {
     pub base_url: String,
-    pub id_key: Option<String>,
     pub bulk_uri: Uri,
-    pub authorization: Option<Auth>,
-    pub credentials: Option<rusoto::AwsCredentialsProvider>,
-    pub encoding: EncodingConfigFixed<ElasticSearchEncoder>,
-    pub mode: ElasticSearchCommonMode,
-    pub doc_type: String,
+    pub http_auth: Option<Auth>,
+    pub aws_auth: Option<SharedCredentialsProvider>,
+    pub mode: ElasticsearchCommonMode,
+    pub request_builder: ElasticsearchRequestBuilder,
     pub tls_settings: TlsSettings,
-    pub compression: Compression,
-    pub region: Region,
+    pub region: Option<Region>,
     pub request: RequestConfig,
     pub query_params: HashMap<String, String>,
     pub metric_to_log: MetricToLog,
 }
 
-impl ElasticSearchCommon {
-    pub fn parse_config(config: &ElasticSearchConfig) -> crate::Result<Self> {
+impl ElasticsearchCommon {
+    pub async fn parse_config(config: &ElasticsearchConfig) -> crate::Result<Self> {
         // Test the configured host, but ignore the result
         let uri = format!("{}/_test", &config.endpoint);
-        let uri = uri.parse::<Uri>().with_context(|| InvalidHost {
+        let uri = uri.parse::<Uri>().with_context(|_| InvalidHostSnafu {
             host: &config.endpoint,
         })?;
         if uri.host().is_none() {
@@ -56,30 +55,41 @@ impl ElasticSearchCommon {
         }
 
         let authorization = match &config.auth {
-            Some(ElasticSearchAuth::Basic { user, password }) => Some(Auth::Basic {
+            Some(ElasticsearchAuth::Basic { user, password }) => Some(Auth::Basic {
                 user: user.clone(),
                 password: password.clone(),
             }),
             _ => None,
         };
         let uri = config.endpoint.parse::<UriSerde>()?;
-        let authorization = authorization.choose_one(&uri.auth)?;
+        let http_auth = authorization.choose_one(&uri.auth)?;
         let base_url = uri.uri.to_string().trim_end_matches('/').to_owned();
 
-        let region = match &config.aws {
-            Some(region) => Region::try_from(region)?,
-            None => region_from_endpoint(&base_url)?,
+        let aws_auth = match &config.auth {
+            Some(ElasticsearchAuth::Basic { .. }) | None => None,
+            Some(ElasticsearchAuth::Aws(aws)) => {
+                let region = config
+                    .aws
+                    .as_ref()
+                    .map(|config| config.region())
+                    .ok_or(ParseError::RegionRequired)?
+                    .ok_or(ParseError::RegionRequired)?;
+
+                Some(aws.credentials_provider(region).await?)
+            }
         };
 
-        let credentials = match &config.auth {
-            Some(ElasticSearchAuth::Basic { .. }) | None => None,
-            Some(ElasticSearchAuth::Aws(aws)) => Some(aws.build(&region, None)?),
-        };
-
-        let compression = config.compression;
         let mode = config.common_mode()?;
 
         let doc_type = config.doc_type.clone().unwrap_or_else(|| "_doc".into());
+        let request_builder = ElasticsearchRequestBuilder {
+            compression: config.compression,
+            encoder: ElasticsearchEncoder {
+                transformer: config.encoding.clone(),
+                doc_type,
+                suppress_type_name: config.suppress_type_name,
+            },
+        };
 
         let tower_request = config
             .request
@@ -104,9 +114,8 @@ impl ElasticSearchCommon {
         let bulk_uri = bulk_url.parse::<Uri>().unwrap();
 
         let tls_settings = TlsSettings::from_options(&config.tls)?;
-        let mut config = config.clone();
-        let mut request = config.request;
-        request.add_old_option(config.headers.take());
+        let config = config.clone();
+        let request = config.request;
 
         let metric_config = config.metrics.clone().unwrap_or_default();
         let metric_to_log = MetricToLog::new(
@@ -114,16 +123,15 @@ impl ElasticSearchCommon {
             metric_config.timezone.unwrap_or_default(),
         );
 
+        let region = config.aws.as_ref().and_then(|config| config.region());
+
         Ok(Self {
-            authorization,
+            http_auth,
             base_url,
             bulk_uri,
-            compression,
-            credentials,
-            doc_type,
-            encoding: config.encoding,
-            id_key: config.id_key,
+            aws_auth,
             mode,
+            request_builder,
             query_params,
             request,
             region,
@@ -132,37 +140,47 @@ impl ElasticSearchCommon {
         })
     }
 
-    pub fn signed_request(&self, method: &str, uri: &Uri, use_params: bool) -> SignedRequest {
-        let mut request = SignedRequest::new(method, "es", &self.region, uri.path());
-        request.set_hostname(uri.host().map(|host| host.into()));
-        if use_params {
-            for (key, value) in &self.query_params {
-                request.add_param(key, value);
-            }
-        }
-        request
-    }
-
     pub async fn healthcheck(self, client: HttpClient) -> crate::Result<()> {
         let mut builder = Request::get(format!("{}/_cluster/health", self.base_url));
 
-        match &self.credentials {
-            None => {
-                if let Some(authorization) = &self.authorization {
-                    builder = authorization.apply_builder(builder);
-                }
-            }
-            Some(credentials_provider) => {
-                let mut signer = self.signed_request("GET", builder.uri_ref().unwrap(), false);
-                builder = finish_signer(&mut signer, credentials_provider, builder).await?;
-            }
+        if let Some(authorization) = &self.http_auth {
+            builder = authorization.apply_builder(builder);
         }
-        let request = builder.body(Body::empty())?;
-        let response = client.send(request).await?;
+        let mut request = builder.body(Bytes::new())?;
+
+        if let Some(credentials_provider) = &self.aws_auth {
+            sign_request(&mut request, credentials_provider, &self.region).await?;
+        }
+        let response = client.send(request.map(hyper::Body::from)).await?;
 
         match response.status() {
             StatusCode::OK => Ok(()),
             status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
         }
     }
+}
+
+pub async fn sign_request(
+    request: &mut http::Request<Bytes>,
+    credentials_provider: &SharedCredentialsProvider,
+    region: &Option<Region>,
+) -> crate::Result<()> {
+    let signable_request = SignableRequest::from(&*request);
+    let credentials = credentials_provider.provide_credentials().await?;
+    let mut signing_params_builder = SigningParams::builder()
+        .access_key(credentials.access_key_id())
+        .secret_key(credentials.secret_access_key())
+        .region(region.as_ref().map(|r| r.as_ref()).unwrap_or(""))
+        .service_name("es")
+        .time(SystemTime::now())
+        .settings(SigningSettings::default());
+
+    signing_params_builder.set_security_token(credentials.session_token());
+
+    let (signing_instructions, _signature) =
+        aws_sigv4::http_request::sign(signable_request, &signing_params_builder.build()?)?
+            .into_parts();
+    signing_instructions.apply_to_request(request);
+
+    Ok(())
 }

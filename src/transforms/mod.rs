@@ -14,8 +14,6 @@ pub mod aws_cloudwatch_logs_subscription_parser;
 pub mod aws_ec2_metadata;
 #[cfg(feature = "transforms-coercer")]
 pub mod coercer;
-#[cfg(feature = "transforms-compound")]
-pub mod compound;
 #[cfg(feature = "transforms-concat")]
 pub mod concat;
 #[cfg(feature = "transforms-dedupe")]
@@ -42,6 +40,8 @@ pub mod lua;
 pub mod merge;
 #[cfg(feature = "transforms-metric_to_log")]
 pub mod metric_to_log;
+#[cfg(feature = "transforms-pipelines")]
+pub mod pipelines;
 #[cfg(feature = "transforms-reduce")]
 pub mod reduce;
 #[cfg(feature = "transforms-regex_parser")]
@@ -62,11 +62,14 @@ pub mod sample;
 pub mod split;
 #[cfg(feature = "transforms-tag_cardinality_limit")]
 pub mod tag_cardinality_limit;
+#[cfg(feature = "transforms-throttle")]
+pub mod throttle;
 #[cfg(feature = "transforms-tokenizer")]
 pub mod tokenizer;
 
 pub use vector_core::transform::{
-    FallibleFunctionTransform, FunctionTransform, TaskTransform, Transform,
+    FunctionTransform, OutputBuffer, SyncTransform, TaskTransform, Transform, TransformOutputs,
+    TransformOutputsBuf,
 };
 
 #[derive(Debug, Snafu)]
@@ -80,8 +83,9 @@ enum BuildError {
 
 #[cfg(test)]
 mod test {
-    use crate::event::Event;
     use vector_core::transform::FunctionTransform;
+
+    use crate::{event::Event, transforms::OutputBuffer};
 
     /// Transform a single `Event` through the `FunctionTransform`
     ///
@@ -95,9 +99,9 @@ mod test {
     // issue a unused warnings about the import above.
     #[allow(dead_code)]
     pub fn transform_one(ft: &mut dyn FunctionTransform, event: Event) -> Option<Event> {
-        let mut buf = Vec::with_capacity(1);
+        let mut buf = OutputBuffer::with_capacity(1);
         ft.transform(&mut buf, event);
-        assert!(buf.len() < 2);
-        buf.into_iter().next()
+        assert!(buf.len() <= 1);
+        buf.into_events().next()
     }
 }

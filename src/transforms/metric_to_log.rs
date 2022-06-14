@@ -1,17 +1,20 @@
+use chrono::Utc;
+use lookup::path;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use vector_common::TimeZone;
+
 use crate::{
     config::{
-        log_schema, DataType, GenerateConfig, TransformConfig, TransformContext,
+        log_schema, DataType, GenerateConfig, Input, Output, TransformConfig, TransformContext,
         TransformDescription,
     },
     event::{self, Event, LogEvent, Metric},
-    internal_events::MetricToLogFailedSerialize,
-    transforms::{FunctionTransform, Transform},
+    internal_events::MetricToLogSerializeError,
+    schema,
+    transforms::{FunctionTransform, OutputBuffer, Transform},
     types::Conversion,
 };
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use shared::TimeZone;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -44,12 +47,16 @@ impl TransformConfig for MetricToLogConfig {
         )))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Metric
+    fn input(&self) -> Input {
+        Input::metric()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
+    }
+
+    fn enable_concurrency(&self) -> bool {
+        true
     }
 
     fn transform_type(&self) -> &'static str {
@@ -78,7 +85,7 @@ impl MetricToLog {
 
     pub fn transform_one(&self, metric: Metric) -> Option<LogEvent> {
         serde_json::to_value(&metric)
-            .map_err(|error| emit!(&MetricToLogFailedSerialize { error }))
+            .map_err(|error| emit!(MetricToLogSerializeError { error }))
             .ok()
             .and_then(|value| match value {
                 Value::Object(object) => {
@@ -86,21 +93,21 @@ impl MetricToLog {
                     let mut log = LogEvent::new_with_metadata(metric.metadata().clone());
 
                     for (key, value) in object {
-                        log.insert_flat(key, value);
+                        log.insert(path!(&key), value);
                     }
 
                     let timestamp = log
-                        .remove(&self.timestamp_key)
+                        .remove(self.timestamp_key.as_str())
                         .and_then(|value| {
                             Conversion::Timestamp(self.timezone)
-                                .convert(value.into_bytes())
+                                .convert(value.coerce_to_bytes())
                                 .ok()
                         })
                         .unwrap_or_else(|| event::Value::Timestamp(Utc::now()));
-                    log.insert(&log_schema().timestamp_key(), timestamp);
+                    log.insert(log_schema().timestamp_key(), timestamp);
 
-                    if let Some(host) = log.remove_prune(&self.host_tag, true) {
-                        log.insert(&log_schema().host_key(), host);
+                    if let Some(host) = log.remove_prune(self.host_tag.as_str(), true) {
+                        log.insert(log_schema().host_key(), host);
                     }
 
                     Some(log)
@@ -111,7 +118,7 @@ impl MetricToLog {
 }
 
 impl FunctionTransform for MetricToLog {
-    fn transform(&mut self, output: &mut Vec<Event>, event: Event) {
+    fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         let retval: Option<Event> = self
             .transform_one(event.into_metric())
             .map(|log| log.into());
@@ -121,15 +128,19 @@ impl FunctionTransform for MetricToLog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::event::{
-        metric::{MetricKind, MetricValue, StatisticKind},
-        Metric, Value,
-    };
-    use crate::transforms::test::transform_one;
+    use std::collections::BTreeMap;
+
     use chrono::{offset::TimeZone, DateTime, Utc};
     use pretty_assertions::assert_eq;
-    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::{
+        event::{
+            metric::{MetricKind, MetricValue, StatisticKind},
+            Metric, Value,
+        },
+        transforms::test::transform_one,
+    };
 
     #[test]
     fn generate_config() {
@@ -168,7 +179,7 @@ mod tests {
         let metadata = counter.metadata().clone();
 
         let log = do_transform(counter).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
@@ -195,7 +206,7 @@ mod tests {
         let metadata = gauge.metadata().clone();
 
         let log = do_transform(gauge).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
@@ -222,7 +233,7 @@ mod tests {
         let metadata = set.metadata().clone();
 
         let log = do_transform(set).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
@@ -251,7 +262,7 @@ mod tests {
         let metadata = distro.metadata().clone();
 
         let log = do_transform(distro).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
@@ -299,7 +310,7 @@ mod tests {
         let metadata = histo.metadata().clone();
 
         let log = do_transform(histo).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
@@ -345,14 +356,14 @@ mod tests {
         let metadata = summary.metadata().clone();
 
         let log = do_transform(summary).unwrap();
-        let collected: Vec<_> = log.all_fields().collect();
+        let collected: Vec<_> = log.all_fields().unwrap().collect();
 
         assert_eq!(
             collected,
             vec![
                 (String::from("aggregated_summary.count"), &Value::from(30)),
                 (
-                    String::from("aggregated_summary.quantiles[0].upper_limit"),
+                    String::from("aggregated_summary.quantiles[0].quantile"),
                     &Value::from(50.0)
                 ),
                 (
@@ -360,7 +371,7 @@ mod tests {
                     &Value::from(10.0)
                 ),
                 (
-                    String::from("aggregated_summary.quantiles[1].upper_limit"),
+                    String::from("aggregated_summary.quantiles[1].quantile"),
                     &Value::from(90.0)
                 ),
                 (

@@ -1,13 +1,20 @@
-use crate::expression::{Expr, Literal, Resolved};
-use crate::parser::{
-    ast::{self, Ident},
-    Node,
-};
-use crate::{Context, Expression, Span, State, TypeDef, Value};
-use diagnostic::{DiagnosticError, Label, Note};
+use std::{convert::TryFrom, fmt};
+
+use diagnostic::{DiagnosticMessage, Label, Note};
 use lookup::LookupBuf;
-use std::convert::TryFrom;
-use std::fmt;
+use value::Value;
+
+use crate::{
+    expression::{Expr, Resolved},
+    parser::{
+        ast::{self, Ident},
+        Node,
+    },
+    state::{ExternalEnv, LocalEnv},
+    type_def::Details,
+    value::kind::DefaultValue,
+    Context, Expression, Span, TypeDef,
+};
 
 #[derive(Clone, PartialEq)]
 pub struct Assignment {
@@ -17,25 +24,26 @@ pub struct Assignment {
 impl Assignment {
     pub(crate) fn new(
         node: Node<Variant<Node<ast::AssignmentTarget>, Node<Expr>>>,
-        state: &mut State,
+        local: &mut LocalEnv,
+        external: &mut ExternalEnv,
+        fallible_rhs: Option<&dyn DiagnosticMessage>,
     ) -> Result<Self, Error> {
-        let (span, variant) = node.take();
+        let (_, variant) = node.take();
 
         let variant = match variant {
             Variant::Single { target, expr } => {
                 let target_span = target.span();
                 let expr_span = expr.span();
                 let assignment_span = Span::new(target_span.start(), expr_span.start() - 1);
-                let type_def = expr.type_def(state);
+                let type_def = expr.type_def((local, external));
 
                 // Fallible expressions require infallible assignment.
-                if type_def.is_fallible() {
+                if fallible_rhs.is_some() {
                     return Err(Error {
                         variant: ErrorVariant::FallibleAssignment(
                             target.to_string(),
                             expr.to_string(),
                         ),
-                        span,
                         expr_span,
                         assignment_span,
                     });
@@ -45,7 +53,6 @@ impl Assignment {
                 if matches!(target.as_ref(), ast::AssignmentTarget::Noop) {
                     return Err(Error {
                         variant: ErrorVariant::UnnecessaryNoop(target_span),
-                        span,
                         expr_span,
                         assignment_span,
                     });
@@ -53,12 +60,9 @@ impl Assignment {
 
                 let expr = expr.into_inner();
                 let target = Target::try_from(target.into_inner())?;
-                let value = match &expr {
-                    Expr::Literal(v) => Some(v.to_value()),
-                    _ => None,
-                };
+                let value = expr.as_value();
 
-                target.insert_type_def(state, type_def, value);
+                target.insert_type_def(local, external, type_def, value);
 
                 Variant::Single {
                     target,
@@ -71,7 +75,7 @@ impl Assignment {
                 let err_span = err.span();
                 let expr_span = expr.span();
                 let assignment_span = Span::new(ok_span.start(), err_span.end());
-                let type_def = expr.type_def(state);
+                let type_def = expr.type_def((local, external));
 
                 // Infallible expressions do not need fallible assignment.
                 if type_def.is_infallible() {
@@ -82,7 +86,6 @@ impl Assignment {
                             ok_span,
                             err_span,
                         ),
-                        span,
                         expr_span,
                         assignment_span,
                     });
@@ -95,7 +98,6 @@ impl Assignment {
                 if ok_noop && err_noop {
                     return Err(Error {
                         variant: ErrorVariant::UnnecessaryNoop(ok_span),
-                        span,
                         expr_span,
                         assignment_span,
                     });
@@ -108,26 +110,23 @@ impl Assignment {
                 // "err" target.
                 let ok = Target::try_from(ok.into_inner())?;
                 let type_def = type_def.infallible();
-                let default = type_def.kind().default_value();
-                let value = match &expr {
-                    Expr::Literal(v) => Some(v.to_value()),
-                    _ => None,
-                };
+                let default_value = type_def.default_value();
+                let value = expr.as_value();
 
-                ok.insert_type_def(state, type_def, value);
+                ok.insert_type_def(local, external, type_def, value);
 
                 // "err" target is assigned `null` or a string containing the
                 // error message.
                 let err = Target::try_from(err.into_inner())?;
-                let type_def = TypeDef::new().bytes().add_null().infallible();
+                let type_def = TypeDef::bytes().add_null().infallible();
 
-                err.insert_type_def(state, type_def, None);
+                err.insert_type_def(local, external, type_def, None);
 
                 Variant::Infallible {
                     ok,
                     err,
                     expr: Box::new(expr),
-                    default,
+                    default: default_value,
                 }
             }
         };
@@ -135,12 +134,22 @@ impl Assignment {
         Ok(Self { variant })
     }
 
-    pub(crate) fn noop() -> Self {
-        let target = Target::Noop;
-        let expr = Box::new(Expr::Literal(Literal::Null));
-        let variant = Variant::Single { target, expr };
+    /// Get a list of targets for this assignment.
+    ///
+    /// For regular assignments, this contains a single target, for infallible
+    /// assignments, it'll contain both the `ok` and `err` target.
+    pub(crate) fn targets(&self) -> Vec<Target> {
+        let mut targets = Vec::with_capacity(2);
 
-        Self { variant }
+        match &self.variant {
+            Variant::Single { target, .. } => targets.push(target.clone()),
+            Variant::Infallible { ok, err, .. } => {
+                targets.push(ok.clone());
+                targets.push(err.clone());
+            }
+        }
+
+        targets
     }
 }
 
@@ -149,7 +158,7 @@ impl Expression for Assignment {
         self.variant.resolve(ctx)
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
         self.variant.type_def(state)
     }
 }
@@ -181,62 +190,49 @@ impl fmt::Debug for Assignment {
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub enum Target {
+pub(crate) enum Target {
     Noop,
-    Internal(Ident, Option<LookupBuf>),
-    External(Option<LookupBuf>),
+    Internal(Ident, LookupBuf),
+    External(LookupBuf),
 }
 
 impl Target {
-    fn insert_type_def(&self, state: &mut State, type_def: TypeDef, value: Option<Value>) {
-        use Target::*;
-
-        fn set_type_def(
-            current_type_def: &TypeDef,
-            new_type_def: TypeDef,
-            path: &Option<LookupBuf>,
-        ) -> TypeDef {
-            // If the assignment is onto root or has no path (root variable assignment), use the
-            // new type def, otherwise merge the type defs.
-            if path.as_ref().map(|path| path.is_root()).unwrap_or(true) {
-                new_type_def
-            } else {
-                current_type_def.clone().merge_overwrite(new_type_def)
-            }
-        }
-
+    fn insert_type_def(
+        &self,
+        local: &mut LocalEnv,
+        external: &mut ExternalEnv,
+        new_type_def: TypeDef,
+        value: Option<Value>,
+    ) {
         match self {
-            Noop => {}
-            Internal(ident, path) => {
-                let td = match path {
-                    None => type_def,
-                    Some(path) => type_def.for_path(path.clone()),
-                };
-
-                let type_def = match state.variable(ident) {
-                    None => td,
-                    Some(&Details { ref type_def, .. }) => set_type_def(type_def, td, path),
+            Self::Noop => {}
+            Self::Internal(ident, path) => {
+                let type_def = match local.variable(ident) {
+                    None => {
+                        if path.is_root() {
+                            new_type_def
+                        } else {
+                            new_type_def.for_path(&path.to_lookup())
+                        }
+                    }
+                    Some(&Details { ref type_def, .. }) => type_def
+                        .clone()
+                        .with_type_set_at_path(&path.to_lookup(), new_type_def),
                 };
 
                 let details = Details { type_def, value };
-
-                state.insert_variable(ident.clone(), details);
+                local.insert_variable(ident.clone(), details);
             }
 
-            External(path) => {
-                let td = match path {
-                    None => type_def,
-                    Some(path) => type_def.for_path(path.clone()),
-                };
-
-                let type_def = match state.target() {
-                    None => td,
-                    Some(&Details { ref type_def, .. }) => set_type_def(type_def, td, path),
-                };
-
-                let details = Details { type_def, value };
-
-                state.update_target(details);
+            Self::External(path) => {
+                external.update_target(Details {
+                    type_def: external
+                        .target()
+                        .type_def
+                        .clone()
+                        .with_type_set_at_path(&path.to_lookup(), new_type_def),
+                    value,
+                });
             }
         }
     }
@@ -249,9 +245,9 @@ impl Target {
             Internal(ident, path) => {
                 // Get the provided path, or else insert into the variable
                 // without any path appended and return early.
-                let path = match path {
-                    Some(path) => path,
-                    None => return ctx.state_mut().insert_variable(ident.clone(), value),
+                let path = match path.is_root() {
+                    false => path,
+                    true => return ctx.state_mut().insert_variable(ident.clone(), value),
                 };
 
                 // Update existing variable using the provided path, or create a
@@ -265,9 +261,7 @@ impl Target {
             }
 
             External(path) => {
-                let _ = ctx
-                    .target_mut()
-                    .insert(path.as_ref().unwrap_or(&LookupBuf::root()), value);
+                let _ = ctx.target_mut().target_insert(path, value);
             }
         }
     }
@@ -279,10 +273,10 @@ impl fmt::Display for Target {
 
         match self {
             Noop => f.write_str("_"),
-            Internal(ident, Some(path)) => write!(f, "{}{}", ident, path),
-            Internal(ident, None) => ident.fmt(f),
-            External(Some(path)) => write!(f, ".{}", path),
-            External(None) => f.write_str("."),
+            Internal(ident, path) if path.is_root() => ident.fmt(f),
+            Internal(ident, path) => write!(f, "{}{}", ident, path),
+            External(path) if path.is_root() => f.write_str("."),
+            External(path) => write!(f, ".{}", path),
         }
     }
 }
@@ -293,10 +287,10 @@ impl fmt::Debug for Target {
 
         match self {
             Noop => f.write_str("Noop"),
-            Internal(ident, Some(path)) => write!(f, "Internal({}{})", ident, path),
-            Internal(ident, _) => write!(f, "Internal({})", ident),
-            External(Some(path)) => write!(f, "External({})", path),
-            External(_) => f.write_str("External(.)"),
+            Internal(ident, path) if path.is_root() => write!(f, "Internal({})", ident),
+            Internal(ident, path) => write!(f, "Internal({}{})", ident, path),
+            External(path) if path.is_root() => f.write_str("External(.)"),
+            External(path) => write!(f, "External({})", path),
         }
     }
 }
@@ -318,20 +312,21 @@ impl TryFrom<ast::AssignmentTarget> for Target {
                 let span = Span::new(target_span.start(), path_span.end());
 
                 match target {
-                    ast::QueryTarget::Internal(ident) => Internal(ident, Some(path)),
-                    ast::QueryTarget::External => External(Some(path)),
+                    ast::QueryTarget::Internal(ident) => Internal(ident, path),
+                    ast::QueryTarget::External => External(path),
                     _ => {
                         return Err(Error {
                             variant: ErrorVariant::InvalidTarget(span),
-                            span,
                             expr_span: span,
                             assignment_span: span,
                         })
                     }
                 }
             }
-            ast::AssignmentTarget::Internal(ident, path) => Internal(ident, path.map(Into::into)),
-            ast::AssignmentTarget::External(path) => External(path.map(Into::into)),
+            ast::AssignmentTarget::Internal(ident, path) => {
+                Internal(ident, path.unwrap_or_else(LookupBuf::root))
+            }
+            ast::AssignmentTarget::External(path) => External(path.unwrap_or_else(LookupBuf::root)),
         };
 
         Ok(target)
@@ -341,7 +336,7 @@ impl TryFrom<ast::AssignmentTarget> for Target {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Variant<T, U> {
+pub(crate) enum Variant<T, U> {
     Single {
         target: T,
         expr: Box<U>,
@@ -392,7 +387,7 @@ where
         Ok(value)
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
         use Variant::*;
 
         match self {
@@ -419,24 +414,15 @@ where
 
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-pub(crate) struct Details {
-    pub type_def: TypeDef,
-    pub value: Option<Value>,
-}
-
-// -----------------------------------------------------------------------------
-
 #[derive(Debug)]
-pub struct Error {
+pub(crate) struct Error {
     variant: ErrorVariant,
-    span: Span,
     expr_span: Span,
     assignment_span: Span,
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum ErrorVariant {
+pub(crate) enum ErrorVariant {
     #[error("unnecessary no-op assignment")]
     UnnecessaryNoop(Span),
 
@@ -462,7 +448,7 @@ impl std::error::Error for Error {
     }
 }
 
-impl DiagnosticError for Error {
+impl DiagnosticMessage for Error {
     fn code(&self) -> usize {
         use ErrorVariant::*;
 

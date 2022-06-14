@@ -1,7 +1,12 @@
-use crate::expression::{Expr, Resolved};
-use crate::{Context, Expression, State, TypeDef, Value};
-use std::collections::BTreeMap;
-use std::{fmt, ops::Deref};
+use std::{collections::BTreeMap, fmt, ops::Deref};
+
+use value::Value;
+
+use crate::{
+    expression::{Expr, Resolved},
+    state::{ExternalEnv, LocalEnv},
+    Context, Expression, TypeDef,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Object {
@@ -39,7 +44,7 @@ impl Expression for Object {
             .map(Value::Object)
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
         let type_defs = self
             .inner
             .iter()
@@ -50,7 +55,12 @@ impl Expression for Object {
         // fallible.
         let fallible = type_defs.values().any(TypeDef::is_fallible);
 
-        TypeDef::new().object(type_defs).with_fallibility(fallible)
+        let collection = type_defs
+            .into_iter()
+            .map(|(field, type_def)| (field.into(), type_def.into()))
+            .collect::<BTreeMap<_, _>>();
+
+        TypeDef::object(collection).with_fallibility(fallible)
     }
 }
 

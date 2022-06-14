@@ -1,10 +1,10 @@
-use crate::{
-    buffers::Acker,
-    config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
-    event::Event,
-    internal_events::PulsarEncodeEventFailed,
-    sinks::util::encoding::{EncodingConfig, EncodingConfiguration},
+use std::{
+    collections::HashSet,
+    num::NonZeroUsize,
+    pin::Pin,
+    task::{Context, Poll},
 };
+
 use futures::{future::BoxFuture, ready, stream::FuturesUnordered, FutureExt, Sink, Stream};
 use pulsar::{
     message::proto, producer::SendFuture, proto::CommandSendReceipt, Authentication,
@@ -12,10 +12,20 @@ use pulsar::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::{
-    collections::HashSet,
-    pin::Pin,
-    task::{Context, Poll},
+use vector_buffers::Acker;
+use vector_common::internal_event::{BytesSent, EventsSent};
+
+use crate::{
+    config::{
+        log_schema, AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext,
+        SinkDescription,
+    },
+    event::Event,
+    internal_events::PulsarEncodeEventError,
+    sinks::util::{
+        encoding::{EncodingConfig, EncodingConfiguration},
+        metadata::RequestMetadata,
+    },
 };
 
 #[derive(Debug, Snafu)]
@@ -35,14 +45,14 @@ pub struct PulsarSinkConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AuthConfig {
+struct AuthConfig {
     name: String,  // "token"
     token: String, // <jwt token>
 }
 
 #[derive(Clone, Copy, Debug, Derivative, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum Encoding {
+pub(self) enum Encoding {
     Text,
     Json,
     Avro,
@@ -54,15 +64,32 @@ type BoxedPulsarProducer = Box<PulsarProducer>;
 enum PulsarSinkState {
     None,
     Ready(BoxedPulsarProducer),
-    Sending(BoxFuture<'static, (BoxedPulsarProducer, Result<SendFuture, PulsarError>)>),
+    Sending(
+        BoxFuture<
+            'static,
+            (
+                BoxedPulsarProducer,
+                Result<SendFuture, PulsarError>,
+                RequestMetadata,
+            ),
+        >,
+    ),
 }
 
 struct PulsarSink {
     encoding: EncodingConfig<Encoding>,
     avro_schema: Option<avro_rs::Schema>,
     state: PulsarSinkState,
-    in_flight:
-        FuturesUnordered<BoxFuture<'static, (usize, Result<CommandSendReceipt, PulsarError>)>>,
+    in_flight: FuturesUnordered<
+        BoxFuture<
+            'static,
+            (
+                usize,
+                Result<CommandSendReceipt, PulsarError>,
+                RequestMetadata,
+            ),
+        >,
+    >,
 
     acker: Acker,
     seq_head: usize,
@@ -96,24 +123,28 @@ impl SinkConfig for PulsarSinkConfig {
         let producer = self
             .create_pulsar_producer()
             .await
-            .context(CreatePulsarSink)?;
+            .context(CreatePulsarSinkSnafu)?;
         let sink = PulsarSink::new(producer, self.encoding.clone(), cx.acker())?;
 
         let producer = self
             .create_pulsar_producer()
             .await
-            .context(CreatePulsarSink)?;
+            .context(CreatePulsarSinkSnafu)?;
         let healthcheck = healthcheck(producer).boxed();
 
-        Ok((super::VectorSink::Sink(Box::new(sink)), healthcheck))
+        Ok((super::VectorSink::from_event_sink(sink), healthcheck))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
     fn sink_type(&self) -> &'static str {
         "pulsar"
+    }
+
+    fn acknowledgements(&self) -> Option<&AcknowledgementsConfig> {
+        None
     }
 }
 
@@ -187,7 +218,7 @@ impl PulsarSink {
 
     fn poll_in_flight_prepare(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if let PulsarSinkState::Sending(fut) = &mut self.state {
-            let (producer, result) = ready!(fut.as_mut().poll(cx));
+            let (producer, result, metadata) = ready!(fut.as_mut().poll(cx));
 
             let seqno = self.seq_head;
             self.seq_head += 1;
@@ -198,7 +229,7 @@ impl PulsarSink {
                     Ok(fut) => fut.await,
                     Err(error) => Err(error),
                 };
-                (seqno, result)
+                (seqno, result, metadata)
             }));
         }
 
@@ -220,11 +251,13 @@ impl Sink<Event> for PulsarSink {
             "Expected `poll_ready` to be called first."
         );
 
-        let message = encode_event(item, &self.encoding, &self.avro_schema).map_err(|e| {
-            emit!(&PulsarEncodeEventFailed {
-                error: &*e.to_string()
-            })
-        })?;
+        let metadata_builder = RequestMetadata::builder(&item);
+        let message = encode_event(item, &self.encoding, &self.avro_schema)
+            .map_err(|error| emit!(PulsarEncodeEventError { error }))?;
+
+        let message_len =
+            NonZeroUsize::new(message.len()).expect("payload should never be zero length");
+        let metadata = metadata_builder.with_request_size(message_len);
 
         let mut producer = match std::mem::replace(&mut self.state, PulsarSinkState::None) {
             PulsarSinkState::Ready(producer) => producer,
@@ -235,7 +268,7 @@ impl Sink<Event> for PulsarSink {
             &mut self.state,
             PulsarSinkState::Sending(Box::pin(async move {
                 let result = producer.send(message).await;
-                (producer, result)
+                (producer, result, metadata)
             })),
         );
 
@@ -248,13 +281,24 @@ impl Sink<Event> for PulsarSink {
         let this = Pin::into_inner(self);
         while !this.in_flight.is_empty() {
             match ready!(Pin::new(&mut this.in_flight).poll_next(cx)) {
-                Some((seqno, Ok(result))) => {
+                Some((seqno, Ok(result), metadata)) => {
                     trace!(
                         message = "Pulsar sink produced message.",
                         message_id = ?result.message_id,
                         producer_id = %result.producer_id,
                         sequence_id = %result.sequence_id,
                     );
+
+                    emit!(EventsSent {
+                        count: metadata.event_count(),
+                        byte_size: metadata.events_byte_size(),
+                        output: None,
+                    });
+
+                    emit!(BytesSent {
+                        byte_size: metadata.request_encoded_size(),
+                        protocol: "tcp",
+                    });
 
                     this.pending_acks.insert(seqno);
 
@@ -265,7 +309,7 @@ impl Sink<Event> for PulsarSink {
                     }
                     this.acker.ack(num_to_ack);
                 }
-                Some((_, Err(error))) => {
+                Some((_, Err(error), _)) => {
                     error!(message = "Pulsar sink generated an error.", %error);
                     return Poll::Ready(Err(()));
                 }
@@ -293,7 +337,7 @@ fn encode_event(
         Encoding::Json => serde_json::to_vec(&log)?,
         Encoding::Text => log
             .get(log_schema().message_key())
-            .map(|v| v.as_bytes().to_vec())
+            .map(|v| v.coerce_to_bytes().to_vec())
             .unwrap_or_default(),
         Encoding::Avro => {
             let value = avro_rs::to_value(log)?;
@@ -311,8 +355,9 @@ fn encode_event(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn generate_config() {
@@ -393,10 +438,19 @@ mod tests {
 #[cfg(feature = "pulsar-integration-tests")]
 #[cfg(test)]
 mod integration_tests {
-    use super::*;
-    use crate::test_util::{random_lines_with_stream, random_string, trace_init};
     use futures::StreamExt;
     use pulsar::SubType;
+
+    use super::*;
+    use crate::sinks::VectorSink;
+    use crate::test_util::{
+        components::{run_and_assert_sink_compliance, SINK_TAGS},
+        random_lines_with_stream, random_string, trace_init,
+    };
+
+    fn pulsar_address() -> String {
+        std::env::var("PULSAR_ADDRESS").unwrap_or_else(|_| "pulsar://127.0.0.1:6650".into())
+    }
 
     #[tokio::test]
     async fn pulsar_happy() {
@@ -407,7 +461,7 @@ mod integration_tests {
 
         let topic = format!("test-{}", random_string(10));
         let cnf = PulsarSinkConfig {
-            endpoint: "pulsar://127.0.0.1:6650".to_owned(),
+            endpoint: pulsar_address(),
             topic: topic.clone(),
             encoding: Encoding::Text.into(),
             auth: None,
@@ -431,10 +485,11 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let (acker, ack_counter) = Acker::new_for_testing();
+        let (acker, ack_counter) = Acker::basic();
         let producer = cnf.create_pulsar_producer().await.unwrap();
         let sink = PulsarSink::new(producer, cnf.encoding, acker).unwrap();
-        events.map(Ok).forward(sink).await.unwrap();
+        let sink = VectorSink::from_event_sink(sink);
+        run_and_assert_sink_compliance(sink, events, &SINK_TAGS).await;
 
         assert_eq!(
             ack_counter.load(std::sync::atomic::Ordering::Relaxed),

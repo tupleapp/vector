@@ -1,22 +1,27 @@
-use crate::{
-    conditions::{AnyCondition, Condition},
-    config::{DataType, TransformConfig, TransformContext, TransformDescription},
-    event::{discriminant::Discriminant, Event, EventMetadata, LogEvent},
-    internal_events::ReduceStaleEventFlushed,
-    transforms::{TaskTransform, Transform},
-};
-use async_stream::stream;
-use futures::{stream, Stream, StreamExt};
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{
     collections::{hash_map, HashMap},
     pin::Pin,
     time::{Duration, Instant},
 };
 
+use async_stream::stream;
+use futures::{stream, Stream, StreamExt};
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    conditions::{AnyCondition, Condition},
+    config::{DataType, Input, Output, TransformConfig, TransformContext, TransformDescription},
+    event::{discriminant::Discriminant, Event, EventMetadata, LogEvent},
+    internal_events::ReduceStaleEventFlushed,
+    schema,
+    transforms::{TaskTransform, Transform},
+};
+
 mod merge_strategy;
 
+use crate::event::Value;
 use merge_strategy::*;
 
 //------------------------------------------------------------------------------
@@ -52,15 +57,15 @@ impl_generate_config_from_default!(ReduceConfig);
 #[typetag::serde(name = "reduce")]
 impl TransformConfig for ReduceConfig {
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
-        Reduce::new(self, &context.enrichment_tables).map(Transform::task)
+        Reduce::new(self, &context.enrichment_tables).map(Transform::event_task)
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Log
+    fn input(&self) -> Input {
+        Input::log()
     }
 
-    fn output_type(&self) -> DataType {
-        DataType::Log
+    fn outputs(&self, _: &schema::Definition) -> Vec<Output> {
+        vec![Output::default(DataType::Log)]
     }
 
     fn transform_type(&self) -> &'static str {
@@ -77,10 +82,10 @@ struct ReduceState {
 
 impl ReduceState {
     fn new(e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) -> Self {
-        let (fields, metadata) = e.into_parts();
-        Self {
-            stale_since: Instant::now(),
-            fields: fields
+        let (value, metadata) = e.into_parts();
+
+        let fields = if let Value::Object(fields) = value {
+            fields
                 .into_iter()
                 .filter_map(|(k, v)| {
                     if let Some(strat) = strategies.get(&k) {
@@ -95,14 +100,27 @@ impl ReduceState {
                         Some((k, v.into()))
                     }
                 })
-                .collect(),
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        Self {
+            stale_since: Instant::now(),
+            fields,
             metadata,
         }
     }
 
     fn add_event(&mut self, e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) {
-        let (fields, metadata) = e.into_parts();
+        let (value, metadata) = e.into_parts();
         self.metadata.merge(metadata);
+
+        let fields = if let Value::Object(fields) = value {
+            fields
+        } else {
+            BTreeMap::new()
+        };
 
         for (k, v) in fields.into_iter() {
             let strategy = strategies.get(&k);
@@ -150,8 +168,8 @@ pub struct Reduce {
     group_by: Vec<String>,
     merge_strategies: IndexMap<String, MergeStrategy>,
     reduce_merge_states: HashMap<Discriminant, ReduceState>,
-    ends_when: Option<Box<dyn Condition>>,
-    starts_when: Option<Box<dyn Condition>>,
+    ends_when: Option<Condition>,
+    starts_when: Option<Condition>,
 }
 
 impl Reduce {
@@ -195,7 +213,7 @@ impl Reduce {
         }
         for k in &flush_discriminants {
             if let Some(t) = self.reduce_merge_states.remove(k) {
-                emit!(&ReduceStaleEventFlushed);
+                emit!(ReduceStaleEventFlushed);
                 output.push(Event::from(t.flush()));
             }
         }
@@ -257,7 +275,7 @@ impl Reduce {
     }
 }
 
-impl TaskTransform for Reduce {
+impl TaskTransform<Event> for Reduce {
     fn transform(
         self: Box<Self>,
         mut input_rx: Pin<Box<dyn Stream<Item = Event> + Send>>,
@@ -304,12 +322,13 @@ impl TaskTransform for Reduce {
 
 #[cfg(test)]
 mod test {
+    use serde_json::json;
+
     use super::*;
     use crate::{
         config::TransformConfig,
         event::{LogEvent, Value},
     };
-    use serde_json::json;
 
     #[test]
     fn generate_config() {
@@ -360,7 +379,7 @@ group_by = [ "request_id" ]
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -417,7 +436,7 @@ merge_strategies.baz = "max"
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -472,7 +491,7 @@ group_by = [ "request_id" ]
 
         let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["message"], "test message 1".into());
@@ -549,7 +568,7 @@ merge_strategies.bar = "concat"
             e_6.into(),
         ];
         let in_stream = Box::pin(stream::iter(inputs));
-        let mut out_stream = reduce.transform(in_stream);
+        let mut out_stream = reduce.transform_events(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_1["foo"], json!([[1, 3], [5, 7], "done"]).into());

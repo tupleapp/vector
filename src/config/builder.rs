@@ -1,15 +1,20 @@
-#[cfg(feature = "api")]
-use super::api;
-#[cfg(feature = "datadog-pipelines")]
-use super::datadog;
-use super::{
-    compiler, provider, ComponentKey, Config, EnrichmentTableConfig, EnrichmentTableOuter,
-    HealthcheckOptions, SinkConfig, SinkOuter, SourceConfig, SourceOuter, TestDefinition,
-    TransformOuter,
-};
+#[cfg(feature = "enterprise")]
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use vector_core::{config::GlobalOptions, default_data_dir, transform::TransformConfig};
+
+#[cfg(feature = "api")]
+use super::api;
+#[cfg(feature = "enterprise")]
+use super::enterprise;
+use super::{
+    compiler, provider, schema, ComponentKey, Config, EnrichmentTableConfig, EnrichmentTableOuter,
+    HealthcheckOptions, SecretBackend, SinkConfig, SinkOuter, SourceConfig, SourceOuter,
+    TestDefinition, TransformOuter,
+};
 
 #[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
@@ -19,9 +24,11 @@ pub struct ConfigBuilder {
     #[cfg(feature = "api")]
     #[serde(default)]
     pub api: api::Options,
-    #[cfg(feature = "datadog-pipelines")]
     #[serde(default)]
-    pub datadog: datadog::Options,
+    pub schema: schema::Options,
+    #[cfg(feature = "enterprise")]
+    #[serde(default)]
+    pub enterprise: Option<enterprise::Options>,
     #[serde(default)]
     pub healthchecks: HealthcheckOptions,
     #[serde(default)]
@@ -33,8 +40,27 @@ pub struct ConfigBuilder {
     #[serde(default)]
     pub transforms: IndexMap<ComponentKey, TransformOuter<String>>,
     #[serde(default)]
-    pub tests: Vec<TestDefinition>,
+    pub tests: Vec<TestDefinition<String>>,
     pub provider: Option<Box<dyn provider::ProviderConfig>>,
+    #[serde(default)]
+    pub secret: IndexMap<ComponentKey, Box<dyn SecretBackend>>,
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Serialize)]
+struct ConfigBuilderHash<'a> {
+    #[cfg(feature = "api")]
+    api: &'a api::Options,
+    schema: &'a schema::Options,
+    global: &'a GlobalOptions,
+    healthchecks: &'a HealthcheckOptions,
+    enrichment_tables: BTreeMap<&'a ComponentKey, &'a EnrichmentTableOuter>,
+    sources: BTreeMap<&'a ComponentKey, &'a SourceOuter>,
+    sinks: BTreeMap<&'a ComponentKey, &'a SinkOuter<String>>,
+    transforms: BTreeMap<&'a ComponentKey, &'a TransformOuter<String>>,
+    tests: &'a Vec<TestDefinition<String>>,
+    provider: &'a Option<Box<dyn provider::ProviderConfig>>,
+    secret: BTreeMap<&'a ComponentKey, &'a dyn SecretBackend>,
 }
 
 impl Clone for ConfigBuilder {
@@ -55,15 +81,17 @@ impl From<Config> for ConfigBuilder {
             global,
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "datadog-pipelines")]
-            datadog,
+            schema,
+            #[cfg(feature = "enterprise")]
+            enterprise,
             healthchecks,
             enrichment_tables,
             sources,
             sinks,
             transforms,
             tests,
-            expansions: _,
+            secret,
+            ..
         } = config;
 
         let transforms = transforms
@@ -76,12 +104,15 @@ impl From<Config> for ConfigBuilder {
             .map(|(key, sink)| (key, sink.map_inputs(ToString::to_string)))
             .collect();
 
+        let tests = tests.into_iter().map(TestDefinition::stringify).collect();
+
         ConfigBuilder {
             global,
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "datadog-pipelines")]
-            datadog,
+            schema,
+            #[cfg(feature = "enterprise")]
+            enterprise,
             healthchecks,
             enrichment_tables,
             sources,
@@ -89,6 +120,7 @@ impl From<Config> for ConfigBuilder {
             transforms,
             provider: None,
             tests,
+            secret,
         }
     }
 }
@@ -135,7 +167,10 @@ impl ConfigBuilder {
             .map(|value| value.to_string())
             .collect::<Vec<_>>();
         let sink = SinkOuter::new(inputs, Box::new(sink));
+        self.add_sink_outer(id, sink);
+    }
 
+    pub fn add_sink_outer(&mut self, id: impl Into<String>, sink: SinkOuter<String>) {
         self.sinks.insert(ComponentKey::from(id.into()), sink);
     }
 
@@ -158,6 +193,10 @@ impl ConfigBuilder {
             .insert(ComponentKey::from(id.into()), transform);
     }
 
+    pub fn set_data_dir(&mut self, path: &Path) {
+        self.global.data_dir = Some(path.to_owned());
+    }
+
     pub fn append(&mut self, with: Self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -166,13 +205,11 @@ impl ConfigBuilder {
             errors.push(error);
         }
 
-        #[cfg(feature = "datadog-pipelines")]
+        self.schema = with.schema;
+
+        #[cfg(feature = "enterprise")]
         {
-            self.datadog = with.datadog;
-            if self.datadog.enabled {
-                // enable other enterprise features
-                self.global.enterprise = true;
-            }
+            self.enterprise = with.enterprise;
         }
 
         self.provider = with.provider;
@@ -234,6 +271,11 @@ impl ConfigBuilder {
                 errors.push(format!("duplicate test name found: {}", wt.name));
             }
         });
+        with.secret.keys().for_each(|k| {
+            if self.secret.contains_key(k) {
+                errors.push(format!("duplicate secret id found: {}", k));
+            }
+        });
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -243,19 +285,115 @@ impl ConfigBuilder {
         self.sinks.extend(with.sinks);
         self.transforms.extend(with.transforms);
         self.tests.extend(with.tests);
+        self.secret.extend(with.secret);
 
         Ok(())
     }
 
+    #[cfg(feature = "enterprise")]
+    /// SHA256 hexadecimal representation of a config builder. This is generated by serializing
+    /// an order-stable JSON of the config builder and feeding its bytes into a SHA256 hasher.
+    pub fn sha256_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let value = serde_json::to_string(&ConfigBuilderHash {
+            #[cfg(feature = "api")]
+            api: &self.api,
+            schema: &self.schema,
+            global: &self.global,
+            healthchecks: &self.healthchecks,
+            enrichment_tables: self.enrichment_tables.iter().collect(),
+            sources: self.sources.iter().collect(),
+            sinks: self.sinks.iter().collect(),
+            transforms: self.transforms.iter().collect(),
+            tests: &self.tests,
+            provider: &self.provider,
+            secret: self.secret.iter().map(|(k, v)| (k, v.as_ref())).collect(),
+        })
+        .expect("should serialize to JSON");
+        let output = Sha256::digest(value.as_bytes());
+
+        hex::encode(output)
+    }
+
     #[cfg(test)]
     pub fn from_toml(input: &str) -> Self {
-        crate::config::format::deserialize(input, Some(crate::config::format::Format::Toml))
-            .unwrap()
+        crate::config::format::deserialize(input, crate::config::format::Format::Toml).unwrap()
     }
 
     #[cfg(test)]
     pub fn from_json(input: &str) -> Self {
-        crate::config::format::deserialize(input, Some(crate::config::format::Format::Json))
-            .unwrap()
+        crate::config::format::deserialize(input, crate::config::format::Format::Json).unwrap()
+    }
+}
+
+#[cfg(all(test, feature = "enterprise", feature = "api"))]
+mod tests {
+    use crate::config::ConfigBuilder;
+
+    #[test]
+    /// We are relying on `serde_json` to serialize keys in the ordered provided. If this test
+    /// fails, it likely means an implementation detail of serialization has changed, which is
+    /// likely to impact the final hash.
+    fn version_json_order() {
+        use serde_json::{json, Value};
+
+        use super::{ConfigBuilder, ConfigBuilderHash};
+
+        // Expected key order of serialization. This is important for guaranteeing that a
+        // hash is reproducible across versions.
+        let expected_keys = [
+            "api",
+            "schema",
+            "global",
+            "healthchecks",
+            "enrichment_tables",
+            "sources",
+            "sinks",
+            "transforms",
+            "tests",
+            "provider",
+            "secret",
+        ];
+
+        let builder = ConfigBuilder::default();
+
+        let value = json!(ConfigBuilderHash {
+            api: &builder.api,
+            schema: &builder.schema,
+            global: &builder.global,
+            healthchecks: &builder.healthchecks,
+            enrichment_tables: builder.enrichment_tables.iter().collect(),
+            sources: builder.sources.iter().collect(),
+            sinks: builder.sinks.iter().collect(),
+            transforms: builder.transforms.iter().collect(),
+            tests: &builder.tests,
+            provider: &builder.provider,
+            secret: builder
+                .secret
+                .iter()
+                .map(|(k, v)| (k, v.as_ref()))
+                .collect(),
+        });
+
+        match value {
+            // Should serialize to a map.
+            Value::Object(map) => {
+                // Check ordering.
+                assert!(map.keys().eq(expected_keys));
+            }
+            _ => panic!("should serialize to object"),
+        }
+    }
+
+    #[test]
+    /// If this hash changes, it means either the `ConfigBuilder` has changed what it
+    /// serializes, or the implementation of `serde_json` has changed. If this test fails, we
+    /// should ideally be able to fix so that the original hash passes!
+    fn version_hash_match() {
+        assert_eq!(
+            "2bc405edda02d6a32f2a93332d5e73840670cce4731a78cf6f73e2f7df8e7229",
+            ConfigBuilder::default().sha256_hash()
+        );
     }
 }

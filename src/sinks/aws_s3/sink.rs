@@ -1,19 +1,22 @@
 use std::io;
 
-use crate::{
-    event::Event,
-    sinks::{
-        s3_common::{config::S3Options, service::S3Metadata, service::S3Request},
-        util::{
-            encoding::{EncodingConfig, StandardEncodings},
-            Compression, RequestBuilder,
-        },
-    },
-};
 use bytes::Bytes;
 use chrono::Utc;
+use codecs::encoding::Framer;
 use uuid::Uuid;
 use vector_core::{event::Finalizable, ByteSizeOf};
+
+use crate::{
+    codecs::Encoder,
+    event::Event,
+    sinks::{
+        s3_common::{
+            config::S3Options,
+            service::{S3Metadata, S3Request},
+        },
+        util::{encoding::Transformer, request_builder::EncodeResult, Compression, RequestBuilder},
+    },
+};
 
 #[derive(Clone)]
 pub struct S3RequestOptions {
@@ -22,14 +25,14 @@ pub struct S3RequestOptions {
     pub filename_append_uuid: bool,
     pub filename_extension: Option<String>,
     pub api_options: S3Options,
-    pub encoding: EncodingConfig<StandardEncodings>,
+    pub encoder: (Transformer, Encoder<Framer>),
     pub compression: Compression,
 }
 
 impl RequestBuilder<(String, Vec<Event>)> for S3RequestOptions {
     type Metadata = S3Metadata;
     type Events = Vec<Event>;
-    type Encoder = EncodingConfig<StandardEncodings>;
+    type Encoder = (Transformer, Encoder<Framer>);
     type Payload = Bytes;
     type Request = S3Request;
     type Error = io::Error; // TODO: this is ugly.
@@ -39,7 +42,7 @@ impl RequestBuilder<(String, Vec<Event>)> for S3RequestOptions {
     }
 
     fn encoder(&self) -> &Self::Encoder {
-        &self.encoding
+        &self.encoder
     }
 
     fn split_input(&self, input: (String, Vec<Event>)) -> (Self::Metadata, Self::Events) {
@@ -55,12 +58,16 @@ impl RequestBuilder<(String, Vec<Event>)> for S3RequestOptions {
         (metadata, events)
     }
 
-    fn build_request(&self, mut metadata: Self::Metadata, payload: Self::Payload) -> Self::Request {
+    fn build_request(
+        &self,
+        mut metadata: Self::Metadata,
+        payload: EncodeResult<Self::Payload>,
+    ) -> Self::Request {
         let filename = {
             let formatted_ts = Utc::now().format(self.filename_time_format.as_str());
 
             self.filename_append_uuid
-                .then(|| format!("{}-{}", formatted_ts, Uuid::new_v4().to_hyphenated()))
+                .then(|| format!("{}-{}", formatted_ts, Uuid::new_v4().hyphenated()))
                 .unwrap_or_else(|| formatted_ts.to_string())
         };
 
@@ -69,19 +76,10 @@ impl RequestBuilder<(String, Vec<Event>)> for S3RequestOptions {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| self.compression.extension().into());
-        metadata.partition_key = format!("{}/{}.{}", metadata.partition_key, filename, extension);
-
-        // TODO: move this into `.request_builder(...)` closure?
-        trace!(
-            message = "Sending events.",
-            bytes = ?payload.len(),
-            events_len = ?metadata.count,
-            bucket = ?self.bucket,
-            key = ?metadata.partition_key
-        );
+        metadata.partition_key = format!("{}{}.{}", metadata.partition_key, filename, extension);
 
         S3Request {
-            body: payload,
+            body: payload.into_payload(),
             bucket: self.bucket.clone(),
             metadata,
             content_encoding: self.compression.content_encoding(),

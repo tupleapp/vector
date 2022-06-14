@@ -2,8 +2,9 @@ mod common;
 mod serialization;
 mod size_of;
 
-use super::*;
 use std::collections::HashSet;
+
+use super::*;
 
 #[test]
 fn event_iteration() {
@@ -11,7 +12,7 @@ fn event_iteration() {
 
     event
         .as_mut_log()
-        .insert("Ke$ha", "It's going down, I'm yelling timber");
+        .insert("\"Ke$ha\"", "It's going down, I'm yelling timber");
     event
         .as_mut_log()
         .insert("Pitbull", "The bigger they are, the harder they fall");
@@ -19,6 +20,7 @@ fn event_iteration() {
     let all = event
         .as_log()
         .all_fields()
+        .unwrap()
         .map(|(k, v)| (k, v.to_string_lossy()))
         .collect::<HashSet<_>>();
     assert_eq!(
@@ -46,7 +48,7 @@ fn event_iteration_order() {
     log.insert("o9amkaRY", Value::from("pGsfG7Nr"));
     log.insert("YRjhxXcg", Value::from("nw8iM5Jr"));
 
-    let collected: Vec<_> = log.all_fields().collect();
+    let collected: Vec<_> = log.all_fields().unwrap().collect();
     assert_eq!(
         collected,
         vec![

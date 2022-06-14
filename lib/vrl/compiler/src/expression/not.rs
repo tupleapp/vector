@@ -1,10 +1,17 @@
-use crate::expression::{Expr, Noop, Resolved};
-use crate::parser::Node;
-use crate::{value::Kind, Context, Expression, Span, State, TypeDef};
-use diagnostic::{DiagnosticError, Label, Note, Urls};
 use std::fmt;
 
-pub type Result = std::result::Result<Not, Error>;
+use diagnostic::{DiagnosticMessage, Label, Note, Urls};
+
+use crate::value::VrlValueConvert;
+use crate::{
+    expression::{Expr, Resolved},
+    parser::Node,
+    state::{ExternalEnv, LocalEnv},
+    value::Kind,
+    Context, Expression, Span, TypeDef,
+};
+
+pub(crate) type Result = std::result::Result<Not, Error>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Not {
@@ -12,13 +19,13 @@ pub struct Not {
 }
 
 impl Not {
-    pub fn new(node: Node<Expr>, not_span: Span, state: &State) -> Result {
+    pub fn new(node: Node<Expr>, not_span: Span, state: (&LocalEnv, &ExternalEnv)) -> Result {
         let (expr_span, expr) = node.take();
         let type_def = expr.type_def(state);
 
         if !type_def.is_boolean() {
             return Err(Error {
-                variant: ErrorVariant::NonBoolean(type_def.kind()),
+                variant: ErrorVariant::NonBoolean(type_def.into()),
                 not_span,
                 expr_span,
             });
@@ -28,12 +35,6 @@ impl Not {
             inner: Box::new(expr),
         })
     }
-
-    pub fn noop() -> Self {
-        Not {
-            inner: Box::new(Noop.into()),
-        }
-    }
 }
 
 impl Expression for Not {
@@ -41,8 +42,10 @@ impl Expression for Not {
         Ok((!self.inner.resolve(ctx)?.try_boolean()?).into())
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
-        self.inner.type_def(state).boolean()
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
+        let fallible = self.inner.type_def(state).is_fallible();
+
+        TypeDef::boolean().with_fallibility(fallible)
     }
 }
 
@@ -63,7 +66,7 @@ pub struct Error {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum ErrorVariant {
+pub(crate) enum ErrorVariant {
     #[error("non-boolean negation")]
     NonBoolean(Kind),
 }
@@ -80,7 +83,7 @@ impl std::error::Error for Error {
     }
 }
 
-impl DiagnosticError for Error {
+impl DiagnosticMessage for Error {
     fn code(&self) -> usize {
         use ErrorVariant::*;
 

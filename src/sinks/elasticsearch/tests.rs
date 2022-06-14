@@ -1,30 +1,35 @@
-use super::BulkAction;
-use crate::event::{LogEvent, Metric, MetricKind, MetricValue, Value};
-use crate::rusoto::AwsAuthentication;
-use crate::sinks::elasticsearch::sink::process_log;
-use crate::sinks::elasticsearch::{
-    DataStreamConfig, ElasticSearchAuth, ElasticSearchCommon, ElasticSearchConfig,
-    ElasticSearchMode,
-};
-use crate::sinks::util::encoding::{Encoder, EncodingConfigFixed};
-use crate::sinks::util::BatchConfig;
-use crate::template::Template;
-use http::Uri;
-use std::collections::BTreeMap;
-use std::convert::TryFrom;
+use std::{collections::BTreeMap, convert::TryFrom};
 
-#[test]
-fn sets_create_action_when_configured() {
-    use crate::config::log_schema;
+use super::BulkAction;
+use crate::sinks::elasticsearch::BulkConfig;
+use crate::sinks::util::encoding::Transformer;
+use crate::{
+    event::{LogEvent, Metric, MetricKind, MetricValue, Value},
+    sinks::{
+        elasticsearch::{
+            sink::process_log, DataStreamConfig, ElasticsearchCommon, ElasticsearchConfig,
+            ElasticsearchMode,
+        },
+        util::encoding::Encoder,
+    },
+    template::Template,
+};
+
+#[tokio::test]
+async fn sets_create_action_when_configured() {
     use chrono::{TimeZone, Utc};
 
-    let config = ElasticSearchConfig {
-        bulk_action: Some(String::from("{{ action }}te")),
-        index: Some(String::from("vector")),
+    use crate::config::log_schema;
+
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: Some(String::from("{{ action }}te")),
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
     log.insert(
@@ -35,14 +40,15 @@ fn sets_create_action_when_configured() {
 
     let mut encoded = vec![];
     let encoded_size = es
-        .encoding
+        .request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"vector","_type":""}}
+    let expected = r#"{"create":{"_index":"vector","_type":"_doc"}}
 {"action":"crea","message":"hello there","timestamp":"2020-12-01T01:02:03Z"}
 "#;
     assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
@@ -56,18 +62,22 @@ fn data_stream_body() -> BTreeMap<String, Value> {
     ds
 }
 
-#[test]
-fn encode_datastream_mode() {
-    use crate::config::log_schema;
+#[tokio::test]
+async fn encode_datastream_mode() {
     use chrono::{TimeZone, Utc};
 
-    let config = ElasticSearchConfig {
-        index: Some(String::from("vector")),
+    use crate::config::log_schema;
+
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: None,
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
-        mode: ElasticSearchMode::DataStream,
+        mode: ElasticsearchMode::DataStream,
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
     log.insert(
@@ -78,29 +88,34 @@ fn encode_datastream_mode() {
 
     let mut encoded = vec![];
     let encoded_size = es
-        .encoding
+        .request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"synthetics-testing-default","_type":""}}
+    let expected = r#"{"create":{"_index":"synthetics-testing-default","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","namespace":"default","type":"synthetics"},"message":"hello there"}
 "#;
     assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
     assert_eq!(encoded.len(), encoded_size);
 }
 
-#[test]
-fn encode_datastream_mode_no_routing() {
-    use crate::config::log_schema;
+#[tokio::test]
+async fn encode_datastream_mode_no_routing() {
     use chrono::{TimeZone, Utc};
 
-    let config = ElasticSearchConfig {
-        index: Some(String::from("vector")),
+    use crate::config::log_schema;
+
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: None,
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
-        mode: ElasticSearchMode::DataStream,
+        mode: ElasticsearchMode::DataStream,
         data_stream: Some(DataStreamConfig {
             auto_routing: false,
             namespace: Template::try_from("something").unwrap(),
@@ -108,7 +123,7 @@ fn encode_datastream_mode_no_routing() {
         }),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
     log.insert("data_stream", data_stream_body());
@@ -118,29 +133,32 @@ fn encode_datastream_mode_no_routing() {
     );
     let mut encoded = vec![];
     let encoded_size = es
-        .encoding
+        .request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"logs-generic-something","_type":""}}
+    let expected = r#"{"create":{"_index":"logs-generic-something","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","namespace":"something","type":"synthetics"},"message":"hello there"}
 "#;
     assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
     assert_eq!(encoded.len(), encoded_size);
 }
 
-#[test]
-fn handle_metrics() {
-    let config = ElasticSearchConfig {
-        bulk_action: Some(String::from("create")),
-        index: Some(String::from("vector")),
+#[tokio::test]
+async fn handle_metrics() {
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: Some(String::from("create")),
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let metric = Metric::new(
         "cpu",
@@ -150,7 +168,8 @@ fn handle_metrics() {
     let log = es.metric_to_log.transform_one(metric).unwrap();
 
     let mut encoded = vec![];
-    es.encoding
+    es.request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
@@ -162,7 +181,7 @@ fn handle_metrics() {
     assert_eq!(encoded_lines.len(), 3); // there's an empty line at the end
     assert_eq!(
         encoded_lines.get(0).unwrap(),
-        r#"{"create":{"_index":"vector","_type":""}}"#
+        r#"{"create":{"_index":"vector","_type":"_doc"}}"#
     );
     assert!(encoded_lines
         .get(1)
@@ -170,15 +189,17 @@ fn handle_metrics() {
         .starts_with(r#"{"gauge":{"value":42.0},"kind":"absolute","name":"cpu","timestamp""#));
 }
 
-#[test]
-fn decode_bulk_action_error() {
-    let config = ElasticSearchConfig {
-        bulk_action: Some(String::from("{{ action }}")),
-        index: Some(String::from("vector")),
+#[tokio::test]
+async fn decode_bulk_action_error() {
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: Some(String::from("{{ action }}")),
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello world");
     log.insert("foo", "bar");
@@ -187,30 +208,36 @@ fn decode_bulk_action_error() {
     assert!(action.is_none());
 }
 
-#[test]
-fn decode_bulk_action() {
-    let config = ElasticSearchConfig {
-        bulk_action: Some(String::from("create")),
-        index: Some(String::from("vector")),
+#[tokio::test]
+async fn decode_bulk_action() {
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: Some(String::from("create")),
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let log = LogEvent::from("hello there");
     let action = es.mode.bulk_action(&log).unwrap();
     assert!(matches!(action, BulkAction::Create));
 }
 
-#[test]
-fn encode_datastream_mode_no_sync() {
-    use crate::config::log_schema;
+#[tokio::test]
+async fn encode_datastream_mode_no_sync() {
     use chrono::{TimeZone, Utc};
 
-    let config = ElasticSearchConfig {
-        index: Some(String::from("vector")),
+    use crate::config::log_schema;
+
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: None,
+            index: Some(String::from("vector")),
+        }),
         endpoint: String::from("https://example.com"),
-        mode: ElasticSearchMode::DataStream,
+        mode: ElasticsearchMode::DataStream,
         data_stream: Some(DataStreamConfig {
             namespace: Template::try_from("something").unwrap(),
             sync_fields: false,
@@ -219,7 +246,7 @@ fn encode_datastream_mode_no_sync() {
         ..Default::default()
     };
 
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
     log.insert("data_stream", data_stream_body());
@@ -230,32 +257,38 @@ fn encode_datastream_mode_no_sync() {
 
     let mut encoded = vec![];
     let encoded_size = es
-        .encoding
+        .request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
         )
         .unwrap();
 
-    let expected = r#"{"create":{"_index":"synthetics-testing-something","_type":""}}
+    let expected = r#"{"create":{"_index":"synthetics-testing-something","_type":"_doc"}}
 {"@timestamp":"2020-12-01T01:02:03Z","data_stream":{"dataset":"testing","type":"synthetics"},"message":"hello there"}
 "#;
     assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
     assert_eq!(encoded.len(), encoded_size);
 }
 
-#[test]
-fn allows_using_excepted_fields() {
-    let config = ElasticSearchConfig {
-        index: Some(String::from("{{ idx }}")),
-        encoding: EncodingConfigFixed {
-            except_fields: Some(vec!["idx".to_string(), "timestamp".to_string()]),
-            ..Default::default()
-        },
+#[tokio::test]
+async fn allows_using_excepted_fields() {
+    let config = ElasticsearchConfig {
+        bulk: Some(BulkConfig {
+            action: None,
+            index: Some(String::from("{{ idx }}")),
+        }),
+        encoding: Transformer::new(
+            None,
+            Some(vec!["idx".to_string(), "timestamp".to_string()]),
+            None,
+        )
+        .unwrap(),
         endpoint: String::from("https://example.com"),
         ..Default::default()
     };
-    let es = ElasticSearchCommon::parse_config(&config).unwrap();
+    let es = ElasticsearchCommon::parse_config(&config).await.unwrap();
 
     let mut log = LogEvent::from("hello there");
     log.insert("foo", "bar");
@@ -263,44 +296,17 @@ fn allows_using_excepted_fields() {
 
     let mut encoded = vec![];
     let encoded_size = es
-        .encoding
+        .request_builder
+        .encoder
         .encode_input(
             vec![process_log(log, &es.mode, &None).unwrap()],
             &mut encoded,
         )
         .unwrap();
 
-    let expected = r#"{"index":{"_index":"purple","_type":""}}
+    let expected = r#"{"index":{"_index":"purple","_type":"_doc"}}
 {"foo":"bar","message":"hello there"}
 "#;
     assert_eq!(std::str::from_utf8(&encoded).unwrap(), expected);
     assert_eq!(encoded.len(), encoded_size);
-}
-
-#[test]
-fn validate_host_header_on_aws_requests() {
-    let config = ElasticSearchConfig {
-        auth: Some(ElasticSearchAuth::Aws(AwsAuthentication::Default {})),
-        endpoint: "http://abc-123.us-east-1.es.amazonaws.com".into(),
-        batch: BatchConfig {
-            max_events: Some(1),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let common = ElasticSearchCommon::parse_config(&config).expect("Config error");
-
-    let signed_request = common.signed_request(
-        "POST",
-        &"http://abc-123.us-east-1.es.amazonaws.com"
-            .parse::<Uri>()
-            .unwrap(),
-        true,
-    );
-
-    assert_eq!(
-        signed_request.hostname(),
-        "abc-123.us-east-1.es.amazonaws.com".to_string()
-    );
 }

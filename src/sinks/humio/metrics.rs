@@ -1,21 +1,36 @@
-use super::{host_key, logs::HumioLogsConfig, Encoding};
-use crate::{
-    config::{
-        DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription, TransformConfig,
-        TransformContext,
-    },
-    sinks::util::{encoding::EncodingConfig, BatchConfig, Compression, TowerRequestConfig},
-    sinks::{Healthcheck, VectorSink},
-    template::Template,
-    tls::TlsOptions,
-    transforms::metric_to_log::MetricToLogConfig,
-};
-use futures::{stream, SinkExt, StreamExt};
+use async_trait::async_trait;
+use futures::StreamExt;
+use futures_util::stream::BoxStream;
 use indoc::indoc;
 use serde::{Deserialize, Serialize};
+use vector_core::{sink::StreamSink, transform::Transform};
+
+use super::{host_key, logs::HumioLogsConfig};
+use crate::{
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, SinkDescription,
+        TransformConfig, TransformContext,
+    },
+    event::{Event, EventArray, EventContainer},
+    sinks::{
+        splunk_hec::{
+            common::SplunkHecDefaultBatchSettings,
+            logs::config::{HecEncoding, HecEncodingMigrator},
+        },
+        util::{
+            encoding::{EncodingConfig, EncodingConfigAdapter},
+            BatchConfig, Compression, TowerRequestConfig,
+        },
+        Healthcheck, VectorSink,
+    },
+    template::Template,
+    tls::TlsConfig,
+    transforms::{metric_to_log::MetricToLogConfig, OutputBuffer},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HumioMetricsConfig {
+#[serde(deny_unknown_fields)]
+struct HumioMetricsConfig {
     #[serde(flatten)]
     transform: MetricToLogConfig,
     token: String,
@@ -23,7 +38,7 @@ pub struct HumioMetricsConfig {
     #[serde(alias = "host")]
     pub(in crate::sinks::humio) endpoint: Option<String>,
     source: Option<Template>,
-    encoding: EncodingConfig<Encoding>,
+    encoding: EncodingConfigAdapter<EncodingConfig<HecEncoding>, HecEncodingMigrator>,
     event_type: Option<Template>,
     #[serde(default = "host_key")]
     host_key: String,
@@ -36,8 +51,14 @@ pub struct HumioMetricsConfig {
     #[serde(default)]
     request: TowerRequestConfig,
     #[serde(default)]
-    batch: BatchConfig,
-    tls: Option<TlsOptions>,
+    batch: BatchConfig<SplunkHecDefaultBatchSettings>,
+    tls: Option<TlsConfig>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde::bool_or_struct",
+        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+    )]
+    acknowledgements: AcknowledgementsConfig,
     // The above settings are copied from HumioLogsConfig. In theory we should do below:
     //
     // #[serde(flatten)]
@@ -67,11 +88,12 @@ impl GenerateConfig for HumioMetricsConfig {
 #[typetag::serde(name = "humio_metrics")]
 impl SinkConfig for HumioMetricsConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let mut transform = self
+        let transform = self
             .transform
             .clone()
             .build(&TransformContext::new_with_globals(cx.globals.clone()))
             .await?;
+
         let sink = HumioLogsConfig {
             token: self.token.clone(),
             endpoint: self.endpoint.clone(),
@@ -85,30 +107,65 @@ impl SinkConfig for HumioMetricsConfig {
             request: self.request,
             batch: self.batch,
             tls: self.tls.clone(),
+            timestamp_nanos_key: None,
+            acknowledgements: Default::default(),
+            // hard coded as humio expects this format so no sense in making it configurable
+            timestamp_key: "timestamp".to_string(),
         };
 
         let (sink, healthcheck) = sink.clone().build(cx).await?;
 
-        let sink = Box::new(sink.into_sink().with_flat_map(move |e| {
-            let mut buf = Vec::with_capacity(1);
-            transform.as_function().transform(&mut buf, e);
-            stream::iter(buf.into_iter()).map(Ok)
-        }));
+        let sink = HumioMetricsSink {
+            inner: sink,
+            transform,
+        };
 
-        Ok((VectorSink::Sink(sink), healthcheck))
+        Ok((VectorSink::Stream(Box::new(sink)), healthcheck))
     }
 
-    fn input_type(&self) -> DataType {
-        DataType::Metric
+    fn input(&self) -> Input {
+        Input::metric()
     }
 
     fn sink_type(&self) -> &'static str {
         "humio_metrics"
     }
+
+    fn acknowledgements(&self) -> Option<&AcknowledgementsConfig> {
+        Some(&self.acknowledgements)
+    }
+}
+
+pub struct HumioMetricsSink {
+    inner: VectorSink,
+    transform: Transform,
+}
+
+#[async_trait]
+impl StreamSink<EventArray> for HumioMetricsSink {
+    async fn run(self: Box<Self>, input: BoxStream<'_, EventArray>) -> Result<(), ()> {
+        let mut transform = self.transform;
+        self.inner
+            .run(input.map(move |events| {
+                let mut buf = OutputBuffer::with_capacity(events.len());
+                for event in events.into_events() {
+                    transform.as_function().transform(&mut buf, event);
+                }
+                // Awkward but necessary for the `EventArray` type
+                let events = buf.into_events().map(Event::into_log).collect::<Vec<_>>();
+                events.into()
+            }))
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::{offset::TimeZone, Utc};
+    use futures::stream;
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::{
         event::{
@@ -116,11 +173,11 @@ mod tests {
             Event, Metric,
         },
         sinks::util::test::{build_test_server, load_sink},
-        test_util::{self, components, components::HTTP_SINK_TAGS},
+        test_util::{
+            self,
+            components::{run_and_assert_sink_compliance, HTTP_SINK_TAGS},
+        },
     };
-    use chrono::{offset::TimeZone, Utc};
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn generate_config() {
@@ -203,7 +260,7 @@ mod tests {
         ];
 
         let len = metrics.len();
-        components::run_sink(sink, stream::iter(metrics), &HTTP_SINK_TAGS).await;
+        run_and_assert_sink_compliance(sink, stream::iter(metrics), &HTTP_SINK_TAGS).await;
 
         let output = rx.take(len).collect::<Vec<_>>().await;
         assert_eq!(

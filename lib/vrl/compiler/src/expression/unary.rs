@@ -1,6 +1,10 @@
-use crate::expression::{Not, Resolved};
-use crate::{Context, Expression, State, TypeDef};
 use std::fmt;
+
+use crate::{
+    expression::{Not, Resolved},
+    state::{ExternalEnv, LocalEnv},
+    Context, Expression, TypeDef,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unary {
@@ -27,7 +31,7 @@ impl Expression for Unary {
         }
     }
 
-    fn type_def(&self, state: &State) -> TypeDef {
+    fn type_def(&self, state: (&LocalEnv, &ExternalEnv)) -> TypeDef {
         use Variant::*;
 
         match &self.variant {

@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
-use vrl::{function::Example, Value};
+use std::{collections::BTreeMap, fs, path::Path};
+
+use ::value::Value;
+use vrl::function::Example;
 
 #[derive(Debug)]
 pub struct Test {
@@ -101,7 +101,7 @@ impl Test {
         }
     }
 
-    pub fn from_example(func: &'static str, example: &Example) -> Self {
+    pub fn from_example(func: impl ToString, example: &Example) -> Self {
         let object = Value::Object(BTreeMap::default());
         let result = match example.result {
             Ok(string) => string.to_owned(),
@@ -110,7 +110,7 @@ impl Test {
 
         Self {
             name: example.title.to_owned(),
-            category: format!("functions/{}", func),
+            category: format!("functions/{}", func.to_string()),
             error: None,
             source: example.source.to_owned(),
             object,
@@ -129,17 +129,21 @@ fn test_category(path: &Path) -> String {
     path.to_string_lossy()
         .strip_prefix("tests/")
         .expect("test")
-        .rsplitn(2, '/')
-        .nth(1)
-        .unwrap()
-        .to_owned()
+        .rsplit_once('/')
+        .map_or(
+            path.to_string_lossy()
+                .strip_prefix("tests/")
+                .unwrap()
+                .to_owned(),
+            |x| x.0.to_owned(),
+        )
 }
 
 fn test_name(path: &Path) -> String {
     path.to_string_lossy()
-        .rsplitn(2, '/')
-        .next()
+        .rsplit_once('/')
         .unwrap()
+        .1
         .trim_end_matches(".vrl")
-        .replace("_", " ")
+        .replace('_', " ")
 }

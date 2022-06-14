@@ -1,10 +1,11 @@
+use std::{convert::Into, fmt};
+
 use crate::Urls;
-use std::convert::Into;
-use std::fmt;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum Note {
     Hint(String),
+    Example(String),
     CoerceValue,
     SeeFunctionDocs(&'static str),
     SeeErrorDocs,
@@ -15,6 +16,8 @@ pub enum Note {
     SeeDocs(String, String),
     #[doc(hidden)]
     Basic(String),
+    #[doc(hidden)]
+    UserErrorMessage(String),
 }
 
 impl Note {
@@ -37,6 +40,9 @@ impl fmt::Display for Note {
         match self {
             Hint(hint) => {
                 write!(f, "hint: {}", hint)
+            }
+            Example(example) => {
+                write!(f, "example: {}", example)
             }
             CoerceValue => {
                 Hint("coerce the value to the required type using a coercion function".to_owned())
@@ -63,6 +69,7 @@ impl fmt::Display for Note {
                 write!(f, "see documentation about {} at {}", kind, url)
             }
             Basic(string) => write!(f, "{}", string),
+            UserErrorMessage(message) => write!(f, "{}", message),
         }
     }
 }

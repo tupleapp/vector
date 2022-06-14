@@ -1,6 +1,7 @@
+use diagnostic::DiagnosticMessage;
+
 use super::Kind;
 use crate::ExpressionError;
-use diagnostic::DiagnosticError;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum Error {
@@ -56,7 +57,7 @@ pub enum Error {
     Merge(Kind, Kind),
 }
 
-impl DiagnosticError for Error {
+impl DiagnosticMessage for Error {
     fn code(&self) -> usize {
         use Error::*;
 
