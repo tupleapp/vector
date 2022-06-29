@@ -1,3 +1,6 @@
+use std::fs::File;
+use std::os::unix::io::FromRawFd;
+use std::os::raw::c_int;
 use crate::{
     codecs::{DecodingConfig, FramingConfig, ParserConfig},
     config::{log_schema, DataType, Resource, SourceConfig, SourceContext, SourceDescription},
@@ -25,6 +28,8 @@ pub struct StdinConfig {
     pub framing: Box<dyn FramingConfig>,
     #[serde(default = "default_decoding")]
     pub decoding: Box<dyn ParserConfig>,
+
+    pub fd: c_int,
 }
 
 impl Default for StdinConfig {
@@ -34,6 +39,7 @@ impl Default for StdinConfig {
             host_key: Default::default(),
             framing: default_framing_stream_based(),
             decoding: default_decoding(),
+            fd: 0,
         }
     }
 }
@@ -49,7 +55,7 @@ impl_generate_config_from_default!(StdinConfig);
 impl SourceConfig for StdinConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         stdin_source(
-            io::BufReader::new(io::stdin()),
+            io::BufReader::new(unsafe { File::from_raw_fd(self.fd) }),
             self.clone(),
             cx.shutdown,
             cx.out,
