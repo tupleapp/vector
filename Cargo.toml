@@ -464,6 +464,7 @@ sources-logstash = ["listenfd", "tokio-util/net", "sources-utils-tcp-keepalive",
 sources-kubernetes_logs = ["file-source", "kubernetes", "transforms-merge", "transforms-regex_parser"]
 sources-mongodb_metrics = ["mongodb"]
 sources-nginx_metrics = ["nom"]
+sources-pipe = ["codecs"]
 sources-postgresql_metrics = ["postgres-openssl", "tokio-postgres"]
 sources-prometheus = ["prometheus-parser", "sinks-prometheus", "sources-utils-http", "warp"]
 sources-socket = ["listenfd", "tokio-util/net", "sources-utils-udp", "sources-utils-tcp-keepalive", "sources-utils-tcp-socket", "sources-utils-tls", "sources-utils-unix", "codecs"]
