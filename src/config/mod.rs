@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::hash::Hash;
 use std::net::SocketAddr;
+use std::os::raw::c_int;
 use std::path::PathBuf;
 pub use vector_core::config::GlobalOptions;
 pub use vector_core::transform::{DataType, ExpandType, TransformConfig, TransformContext};
@@ -458,7 +459,7 @@ inventory::collect!(EnrichmentTableDescription);
 pub enum Resource {
     Port(SocketAddr, Protocol),
     SystemFdOffset(usize),
-    Stdin,
+    Fd(c_int),
     DiskBuffer(String),
 }
 
@@ -533,7 +534,7 @@ impl Display for Resource {
         match self {
             Resource::Port(address, protocol) => write!(fmt, "{} {}", protocol, address),
             Resource::SystemFdOffset(offset) => write!(fmt, "systemd {}th socket", offset + 1),
-            Resource::Stdin => write!(fmt, "stdin"),
+            Resource::Fd(fd) => write!(fmt, "fd: {}", fd),
             Resource::DiskBuffer(name) => write!(fmt, "disk buffer {:?}", name),
         }
     }

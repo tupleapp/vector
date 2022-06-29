@@ -71,7 +71,7 @@ impl SourceConfig for StdinConfig {
     }
 
     fn resources(&self) -> Vec<Resource> {
-        vec![Resource::Stdin]
+        vec![Resource::Fd(self.fd)]
     }
 }
 
