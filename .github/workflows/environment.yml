@@ -28,7 +28,7 @@ jobs:
           username: ${{ secrets.CI_DOCKER_USERNAME }}
           password: ${{ secrets.CI_DOCKER_PASSWORD }}
       - name: Build and push
-        uses: docker/build-push-action@v2.7.0
+        uses: docker/build-push-action@c56af957549030174b10d6867f20e78cfd7debc5
         with:
           context: .
           file: ./scripts/environment/Dockerfile
